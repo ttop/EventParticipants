@@ -9,6 +9,7 @@
 # event list rather than appended.
 #
 
+import logging
 from xml.sax.saxutils import escape as xml_escape
 
 from gi.repository import Gtk, Pango
@@ -18,9 +19,12 @@ from gramps.gen.lib import EventRef, EventRoleType
 from gramps.gen.db import DbTxn
 from gramps.gen.display.name import displayer as name_displayer
 from gramps.gen.datehandler import get_date
+from gramps.gen.errors import HandleError
 from gramps.gen.const import GRAMPS_LOCALE as glocale
 
 _ = glocale.translation.gettext
+
+LOG = logging.getLogger(".AddParticipants")
 
 # Columns in the participant model
 COL_NAME = 0
@@ -152,6 +156,12 @@ class AddParticipants(Gramplet):
     # ------------------------------------------------------------------
 
     def db_changed(self):
+        # A new tree invalidates the cached selection. Without this the
+        # "did the handle change?" test in main() can leave the previous
+        # tree's participants on screen.
+        self.event = None
+        self.event_handle = None
+        self.model.clear()
         self.connect(self.dbstate.db, "person-add", self.on_people_changed)
         self.connect(self.dbstate.db, "person-update", self.on_people_changed)
         self.connect(self.dbstate.db, "person-delete", self.on_people_changed)
@@ -162,6 +172,28 @@ class AddParticipants(Gramplet):
     def on_people_changed(self, *args):
         self.build_people_cache()
         self.refresh_completion()
+
+    # Gramps raises HandleError for a dangling handle rather than returning
+    # None, so every lookup needs a guard: one broken reference anywhere in
+    # the tree would otherwise take out the whole gramplet.
+
+    def _get_person(self, handle):
+        try:
+            return self.dbstate.db.get_person_from_handle(handle)
+        except HandleError:
+            return None
+
+    def _get_family(self, handle):
+        try:
+            return self.dbstate.db.get_family_from_handle(handle)
+        except HandleError:
+            return None
+
+    def _get_event(self, handle):
+        try:
+            return self.dbstate.db.get_event_from_handle(handle)
+        except HandleError:
+            return None
 
     def build_people_cache(self):
         """Load every person once into memory as (label, handle)."""
@@ -179,14 +211,13 @@ class AddParticipants(Gramplet):
         """Name plus birth/death years for disambiguation."""
         name = name_displayer.display(person)
         years = []
-        db = self.dbstate.db
         for ref, marker in (
             (person.get_birth_ref(), "b."),
             (person.get_death_ref(), "d."),
         ):
             year = ""
             if ref:
-                event = db.get_event_from_handle(ref.ref)
+                event = self._get_event(ref.ref)
                 if event:
                     date = event.get_date_object()
                     if date and date.get_year():
@@ -198,12 +229,11 @@ class AddParticipants(Gramplet):
         return name
 
     def _family_label(self, family):
-        db = self.dbstate.db
         names = []
         for get_handle in (family.get_father_handle, family.get_mother_handle):
             handle = get_handle()
             if handle:
-                person = db.get_person_from_handle(handle)
+                person = self._get_person(handle)
                 if person:
                     names.append(name_displayer.display(person))
         if names:
@@ -235,9 +265,8 @@ class AddParticipants(Gramplet):
     # ------------------------------------------------------------------
 
     def main(self):
-        db = self.dbstate.db
         handle = self.get_active("Event")
-        self.event = db.get_event_from_handle(handle) if handle else None
+        self.event = self._get_event(handle) if handle else None
 
         if self.event is None:
             self.event_handle = None
@@ -281,10 +310,10 @@ class AddParticipants(Gramplet):
 
         for class_name, handle in backlinks:
             if class_name == "Person":
-                obj = db.get_person_from_handle(handle)
+                obj = self._get_person(handle)
                 label = self._person_label(obj) if obj else None
             elif class_name == "Family":
-                obj = db.get_family_from_handle(handle)
+                obj = self._get_family(handle)
                 label = self._family_label(obj) if obj else None
             else:
                 continue
@@ -331,6 +360,13 @@ class AddParticipants(Gramplet):
     def stage_person(self, label, handle):
         for row in self.model:
             if row[COL_HANDLE] == handle and row[COL_KIND] == "Person":
+                # refresh_completion() keeps detach-staged people in the
+                # type-ahead, so picking one again has to mean "undo the
+                # detach" rather than silently doing nothing.
+                if row[COL_STATE] == STATE_DETACH:
+                    row[COL_STATE] = STATE_EXISTING
+                    self.refresh_completion()
+                    self.update_status()
                 return
         self.model.append(
             [label, self._default_role(), STATE_NEW, handle,
@@ -413,34 +449,45 @@ class AddParticipants(Gramplet):
             for row in self.model
         ]
 
-        with DbTxn(_("Edit participants of event"), db) as trans:
-            for handle, kind, role, orig_role, state in rows:
-                obj = self._get_object(kind, handle)
-                if obj is None:
-                    continue
-
-                refs = list(obj.get_event_ref_list())
-
-                if state == STATE_NEW:
-                    if any(ref.ref == ev_handle for ref in refs):
+        try:
+            with DbTxn(_("Edit participants of event"), db) as trans:
+                for handle, kind, role, orig_role, state in rows:
+                    obj = self._get_object(kind, handle)
+                    if obj is None:
                         continue
-                    eref = EventRef()
-                    eref.set_reference_handle(ev_handle)
-                    eref.set_role(EventRoleType(role))
-                    refs.insert(self._insert_index(refs, new_sort), eref)
 
-                elif state == STATE_DETACH:
-                    refs = [ref for ref in refs if ref.ref != ev_handle]
+                    refs = list(obj.get_event_ref_list())
 
-                elif role != orig_role:
-                    for ref in refs:
-                        if ref.ref == ev_handle:
-                            ref.set_role(EventRoleType(role))
-                else:
-                    continue
+                    if state == STATE_NEW:
+                        if any(ref.ref == ev_handle for ref in refs):
+                            continue
+                        eref = EventRef()
+                        eref.set_reference_handle(ev_handle)
+                        eref.set_role(EventRoleType(role))
+                        refs.insert(self._insert_index(refs, new_sort), eref)
 
-                obj.set_event_ref_list(refs)
-                self._commit_object(kind, obj, trans)
+                    elif state == STATE_DETACH:
+                        refs = [ref for ref in refs if ref.ref != ev_handle]
+
+                    elif role != orig_role:
+                        for ref in refs:
+                            if ref.ref == ev_handle:
+                                ref.set_role(EventRoleType(role))
+                    else:
+                        continue
+
+                    obj.set_event_ref_list(refs)
+                    self._commit_object(kind, obj, trans)
+        except Exception as err:
+            # DbTxn.__exit__ has already aborted the transaction, so the
+            # database is untouched. An exception raised from a GTK callback
+            # would otherwise reach the user as nothing at all: keep the
+            # pending edits on screen and say what went wrong.
+            LOG.exception("Add Participants: applying changes failed")
+            message = _("Could not apply changes: %s") % err
+            self.status.set_text(message)
+            self.uistate.push_message(self.dbstate, message)
+            return
 
         self.load_participants()
         self.refresh_completion()
@@ -451,11 +498,10 @@ class AddParticipants(Gramplet):
         )
 
     def _get_object(self, kind, handle):
-        db = self.dbstate.db
         if kind == "Person":
-            return db.get_person_from_handle(handle)
+            return self._get_person(handle)
         if kind == "Family":
-            return db.get_family_from_handle(handle)
+            return self._get_family(handle)
         return None
 
     def _commit_object(self, kind, obj, trans):
@@ -473,9 +519,8 @@ class AddParticipants(Gramplet):
         """Chronological position. Undated events keep their place."""
         if not new_sort:
             return len(refs)
-        db = self.dbstate.db
         for index, ref in enumerate(refs):
-            event = db.get_event_from_handle(ref.ref)
+            event = self._get_event(ref.ref)
             if event is None:
                 continue
             sort_value = self._sort_value(event)
