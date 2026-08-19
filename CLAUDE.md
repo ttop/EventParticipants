@@ -57,13 +57,20 @@ The `reload_plugins` addon from https://github.com/kkujansuu/gramps can refresh
 plugin code without a full restart — worth installing if the restart loop gets
 tedious.
 
-## Status: NOT YET RUN IN GRAMPS
+## Status: IN USE
 
-The GTK wiring has still never been exercised — nothing here has been loaded
-into a running Gramps. What *has* been done: every Gramps API call was checked
-against the 6.0 sources in
+Running in Gramps and used against the real tree: participants list, apply,
+undo, type-ahead search and role editing all exercised. Every Gramps API call
+was also checked against the 6.0 sources in
 `/Applications/Gramps.app/Contents/Resources/lib/python3.13/site-packages/gramps`,
 and `test_addparticipants.py` covers the non-GTK logic.
+
+Everything that actually went wrong in use was a *behaviour* problem the source
+reading could not have caught — a blocking index that looked like a broken
+matcher, a default role that made new participants invisible in the Events
+view, married names that live in the family record rather than on the person,
+and alphabetical results burying the best match. When something looks wrong,
+check the data and the running behaviour before re-reading the API.
 
 The original suspect list is resolved — all five were **correct as written**:
 
