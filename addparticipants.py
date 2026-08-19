@@ -104,6 +104,7 @@ class AddParticipants(Gramplet):
         self._index_iter = None
         self._index_raw = False     # reading raw data rather than objects
         self._index_years = {}      # event handle -> year, for labels
+        self._index_spouses = {}    # person handle -> spouse surnames
         self.gui.WIDGET = self.build_gui()
         container = self.gui.get_container_widget()
         if self.gui.textview in container.get_children():
@@ -303,6 +304,10 @@ class AddParticipants(Gramplet):
             self._index_years = self._build_year_map(db)
             with db.get_person_cursor() as cursor:
                 rows = [data for _handle, data in cursor]
+            self._index_spouses = self._build_spouse_map(
+                db, {data["handle"]: _raw_surname(data["primary_name"])
+                     for data in rows}
+            )
             if rows:
                 # Prove the raw layout before committing to it, so a changed
                 # field name degrades to the object API instead of silently
@@ -318,6 +323,11 @@ class AddParticipants(Gramplet):
                 handles = list(db.get_person_handles())
             except Exception:
                 handles = [person.get_handle() for person in db.iter_people()]
+            try:
+                self._index_spouses = self._build_spouse_map(db, None)
+            except Exception:
+                LOG.debug("spouse surnames unavailable", exc_info=True)
+                self._index_spouses = {}
             self._index_iter = iter(handles)
         self._index_id = GLib.idle_add(
             self._index_chunk, priority=GLib.PRIORITY_LOW
@@ -371,6 +381,51 @@ class AddParticipants(Gramplet):
                     years[data["handle"]] = year
         return years
 
+    def _build_spouse_map(self, db, surname_by_handle):
+        """Person handle -> surnames of their spouses.
+
+        Most trees never record a married name: it is implied by the marriage
+        and lives only in the family record. Searching for someone under the
+        surname they married into therefore has to come from here rather than
+        from their alternate names.
+        """
+        if surname_by_handle is None:
+            surname_by_handle = {
+                person.get_handle():
+                    person.get_primary_name().get_surname()
+                for person in db.iter_people()
+            }
+        spouses = {}
+        with db.get_family_cursor() as cursor:
+            for _handle, data in cursor:
+                father = data["father_handle"]
+                mother = data["mother_handle"]
+                if not father or not mother:
+                    continue
+                for person, partner in ((father, mother), (mother, father)):
+                    surname = surname_by_handle.get(partner)
+                    if surname and surname != surname_by_handle.get(person):
+                        spouses.setdefault(person, set()).add(surname)
+        return {handle: sorted(names) for handle, names in spouses.items()}
+
+    def _other_surnames(self, handle, primary_surname, alternates):
+        """Surnames worth showing besides the primary one.
+
+        Alternate surnames appear as they are; a surname reached by marriage
+        is prefixed "m." so it reads correctly in both directions - a husband
+        is not known by his wife's surname, but he is married to it.
+        """
+        others = []
+        for surname in alternates:
+            if surname and surname != primary_surname and surname not in others:
+                others.append(surname)
+        for surname in self._index_spouses.get(handle, ()):
+            marked = _("m. %s") % surname
+            if surname != primary_surname and surname not in others:
+                if marked not in others:
+                    others.append(marked)
+        return others
+
     def _raw_person_entry(self, data):
         """(label, folded search text) straight from stored person data."""
         label = self._raw_person_label(data)
@@ -380,11 +435,10 @@ class AddParticipants(Gramplet):
         """The object path's _person_label, without building a Person."""
         name = name_displayer.raw_display_name(data["primary_name"])
         primary_surname = _raw_surname(data["primary_name"])
-        others = []
-        for alt in data["alternate_names"]:
-            surname = _raw_surname(alt)
-            if surname and surname != primary_surname and surname not in others:
-                others.append(surname)
+        others = self._other_surnames(
+            data["handle"], primary_surname,
+            [_raw_surname(alt) for alt in data["alternate_names"]],
+        )
         years = []
         refs = data["event_ref_list"]
         for key, marker in (("birth_ref_index", "b."),
@@ -411,6 +465,7 @@ class AddParticipants(Gramplet):
             parts.append(_raw_surname(name_data))
             parts.append(name_data["call"])
             parts.append(name_data["nick"])
+        parts.extend(self._index_spouses.get(data["handle"], ()))
         return _fold(" ".join(part for part in parts if part))
 
     def _show_index_progress(self, done):
@@ -439,11 +494,10 @@ class AddParticipants(Gramplet):
         name = name_displayer.display(person)
         primary = person.get_primary_name()
         primary_surname = primary.get_surname() if primary else ""
-        others = []
-        for alt in person.get_alternate_names():
-            surname = alt.get_surname()
-            if surname and surname != primary_surname and surname not in others:
-                others.append(surname)
+        others = self._other_surnames(
+            person.get_handle(), primary_surname,
+            [alt.get_surname() for alt in person.get_alternate_names()],
+        )
         years = []
         for ref, marker in (
             (person.get_birth_ref(), "b."),
@@ -479,6 +533,7 @@ class AddParticipants(Gramplet):
             parts.append(name.get_surname())
             parts.append(name.get_call_name())
             parts.append(name.get_nick_name())
+        parts.extend(self._index_spouses.get(person.get_handle(), ()))
         return _fold(" ".join(part for part in parts if part))
 
     def _person_entry(self, person):

@@ -143,7 +143,7 @@ class Ev:
 class Person:
     def __init__(self,name,b=None,d=None,refs=None,names=None):
         self.name=name; self._b=b; self._d=d; self.refs=refs or []
-        self._names=names
+        self._names=names; self.handle=None
     def get_primary_name(self):
         return self._names[0] if self._names else Name(raw=self.name)
     def get_alternate_names(self):
@@ -172,6 +172,7 @@ class _Cursor:
 class FakeDb:
     def __init__(self):
         self.people={}; self.events={}; self.families={}; self.emitted=[]
+        self.raw_families=[]
     def _ref_index(self, person, handle):
         for i,r in enumerate(person.refs):
             if r.ref==handle: return i
@@ -186,6 +187,8 @@ class FakeDb:
                 "death_ref_index":self._ref_index(p,p._d)}
     def get_person_cursor(self):
         return _Cursor([self._raw_person(h,p) for h,p in self.people.items()])
+    def get_family_cursor(self):
+        return _Cursor(getattr(self, "raw_families", []))
     def get_event_cursor(self):
         return _Cursor([{"handle":h,
                          "date":{"dateval":[0,0,
@@ -219,7 +222,7 @@ def make():
     g.apply_btn=type("B",(),{"set_sensitive":lambda s,v:None})()
     g.entry=type("E",(),{"set_placeholder_text":
         lambda s,t: setattr(g,"placeholder",t)})()
-    g._index_id=0; g._index_iter=None
+    g._index_id=0; g._index_iter=None; g._index_spouses={}
     g.event=None; g.last_status=None; g.placeholder=None
     return g,db
 
@@ -543,6 +546,49 @@ g.build_people_cache(); drain(g)
 check("fell back to the object API", g._index_raw is False)
 check("and still indexed the person (%d)" % len(g.people_labels),
       len(g.people_labels)==1)
+
+print("\n[U] a surname reached by marriage is searchable")
+# Louisa Heitt married Ernest Reyman. Her record carries no married name -
+# that is how nearly every tree stores it - so "Louisa Reyman" has to be
+# found through the family.
+g,db=make()
+db.people["lou"]=Person("x", names=[Name("Louisa","Heitt")])
+db.people["ern"]=Person("x", names=[Name("Ernest August","Reyman")])
+db.raw_families=[{"handle":"f1","father_handle":"ern","mother_handle":"lou"}]
+g.build_people_cache(); drain(g)
+
+def hits(typed):
+    g.refresh_completion(force=True)
+    comp=type("C",(),{"get_model":lambda s: g.completion_model})()
+    return [g.completion_model[i][0]
+            for i in range(len(g.completion_model))
+            if ap.AddParticipants._match_func(comp, typed.casefold(), i, None)]
+
+check("no married name is stored on her",
+      db.people["lou"].get_alternate_names()==[])
+check("'Louisa Reyman' finds her: %r" % hits("Louisa Reyman"),
+      any("Heitt" in m for m in hits("Louisa Reyman")))
+check("'Louisa Heitt' still finds her",
+      any("Heitt" in m for m in hits("Louisa Heitt")))
+check("her label says who she married: %r" % g.people_labels["lou"][0],
+      "Reyman" in g.people_labels["lou"][0])
+check("and it reads as a marriage, not as her own surname",
+      "m. Reyman" in g.people_labels["lou"][0])
+check("'Ernest Heitt' finds him too (symmetric, and true)",
+      any("Reyman" in m for m in hits("Ernest Heitt")))
+check("unrelated names still match nobody", hits("Zebedee Nobody")==[])
+
+print("\n[V] spouse surnames survive the object fallback")
+g,db=make()
+db.people["lou"]=Person("x", names=[Name("Louisa","Heitt")])
+db.people["ern"]=Person("x", names=[Name("Ernest","Reyman")])
+db.raw_families=[{"handle":"f1","father_handle":"ern","mother_handle":"lou"}]
+db.get_person_cursor=lambda: (_ for _ in ()).throw(RuntimeError("no cursor"))
+db.get_person_handles=lambda sort_handles=False: list(db.people)
+g.build_people_cache(); drain(g)
+check("fell back to the object API", g._index_raw is False)
+check("still learned the spouse surname",
+      "Reyman" in g.people_labels["lou"][0])
 
 print("\n" + ("ALL PASSED" if not fails else "FAILURES: %s" % fails))
 sys.exit(1 if fails else 0)
