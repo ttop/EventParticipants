@@ -99,6 +99,14 @@ rather than calling the db directly.
   whose role `is_primary()` (`gen/utils/db.py:274`), so anyone added with
   Unknown never appeared in that column at all. Visibility beats matching
   stock here. Change this back only with a plan for that column.
+- The name index is built **in the background**, `INDEX_CHUNK` people per
+  GLib idle turn, and the search box shows "Indexing names..." until it is
+  done. Indexing costs two database reads per person for the birth and death
+  years, so on a few thousand people a single pass blocks the main loop and
+  the search box silently matches nothing — which is exactly how it was first
+  reported. The build snapshots `get_person_handles()` rather than holding
+  `iter_people()` open, because that keeps a database cursor alive across
+  idle turns while the user can still edit the tree.
 - Applying emits `event-update` for the event afterwards. The event object
   itself is never modified, so nothing else invalidates the Events view's
   cached participant column. That view does watch `person-update`, but its

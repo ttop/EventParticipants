@@ -42,9 +42,28 @@ Gtk.Entry=_Entry; Gtk.EntryCompletion=_EntryCompletion
 Pango=types.ModuleType("Pango")
 Pango.Weight=type("W",(),{"NORMAL":400,"BOLD":700})
 Pango.EllipsizeMode=type("E",(),{"END":3})
-rep.Gtk, rep.Pango = Gtk, Pango; gi.repository=rep
+GLib=types.ModuleType("GLib")
+GLib.PRIORITY_LOW=300
+GLib._sources={}; GLib._next=[1]
+def _idle_add(cb, priority=None):
+    sid=GLib._next[0]; GLib._next[0]+=1; GLib._sources[sid]=cb; return sid
+def _source_remove(sid): GLib._sources.pop(sid,None)
+GLib.idle_add=_idle_add; GLib.source_remove=_source_remove
+
+def drain(g, max_turns=10000):
+    """Run a pending index build to completion; return the number of turns."""
+    turns=0
+    while g._index_id and turns<max_turns:
+        cb=GLib._sources.get(g._index_id)
+        if cb is None: break
+        turns+=1
+        if not cb(): break
+    return turns
+
+rep.Gtk, rep.Pango, rep.GLib = Gtk, Pango, GLib; gi.repository=rep
 sys.modules.update({"gi":gi,"gi.repository":rep,
-                    "gi.repository.Gtk":Gtk,"gi.repository.Pango":Pango})
+                    "gi.repository.Gtk":Gtk,"gi.repository.Pango":Pango,
+                    "gi.repository.GLib":GLib})
 
 class HandleError(Exception): pass
 def _mod(n,**a):
@@ -133,6 +152,7 @@ class FakeDb:
     def __init__(self):
         self.people={}; self.events={}; self.families={}; self.emitted=[]
     def emit(self, signal, args): self.emitted.append((signal, args))
+    def get_person_handles(self, sort_handles=False): return list(self.people)
     def is_open(self): return True
     def iter_people(self):
         for h,p in self.people.items(): p.handle=h; yield p
@@ -157,7 +177,10 @@ def make():
     g._commit_object=lambda kind,obj,trans: g.commits.append((kind,obj))
     g.status=type("L",(),{"set_text":lambda s,t:setattr(g,"last_status",t)})()
     g.apply_btn=type("B",(),{"set_sensitive":lambda s,v:None})()
-    g.event=None; g.last_status=None
+    g.entry=type("E",(),{"set_placeholder_text":
+        lambda s,t: setattr(g,"placeholder",t)})()
+    g._index_id=0; g._index_iter=None
+    g.event=None; g.last_status=None; g.placeholder=None
     return g,db
 
 def row(name,role,state,handle,kind,orig,refidx):
@@ -211,7 +234,7 @@ check("_set_state updates both token and text",
 print("\n[D] incremental people cache")
 g,db=make()
 db.people["p1"]=Person("Zoe"); db.people["p2"]=Person("Amy")
-g.build_people_cache()
+g.build_people_cache(); drain(g)
 check("built and sorted by label %r"%[r[0] for r in g.people_cache],
       [r[0] for r in g.people_cache]==["Amy","Zoe"])
 reads=[]
@@ -310,7 +333,7 @@ db.people["p2"]=Person("x", names=[
     Name("Jane","Smith",ntype=MARRIED),
 ])
 db.people["p3"]=Person("x", names=[Name("Hans","M\u00fcller")])
-g.build_people_cache()
+g.build_people_cache(); drain(g)
 
 check("'John Joy' finds 'Joy, John Mervyn' (order-independent)",
       any("Joy" in m for m in matcher(g,"John Joy")))
@@ -399,6 +422,53 @@ g.on_apply(None)
 check("the reference was removed", len(p.refs)==0)
 check("event-update still emitted, got %r" % db.emitted,
       ("event-update",(["E1"],)) in db.emitted)
+
+print("\n[P] the name index builds in the background, not in one blocking pass")
+g,db=make()
+for i in range(250):
+    db.people["p%d"%i]=Person("x", names=[Name("Given%d"%i,"Sur%d"%i)])
+g.build_people_cache()
+check("returns before the index is finished (%d of 250 so far)"
+      % len(g.people_labels), len(g.people_labels) < 250)
+check("the search box says why it is empty: %r" % g.placeholder,
+      "Indexing" in str(g.placeholder))
+turns=drain(g)
+check("finished across several idle turns (%d)" % turns, turns > 1)
+check("every person ended up indexed (%d)" % len(g.people_labels),
+      len(g.people_labels)==250)
+check("the placeholder goes back to normal: %r" % g.placeholder,
+      "Indexing" not in str(g.placeholder))
+check("and matching works once it is done",
+      len([1 for r in g.people_cache if "Sur7" in r[0]]) >= 1)
+
+print("\n[Q] a tree change abandons an in-flight index")
+g,db=make()
+for i in range(250):
+    db.people["p%d"%i]=Person("x", names=[Name("A%d"%i,"B%d"%i)])
+g.build_people_cache()
+first=g._index_id
+g.build_people_cache()            # e.g. another database-changed
+check("the first build was cancelled", GLib._sources.get(first) is None
+      or g._index_id != first)
+drain(g)
+check("the restarted build still indexes everyone (%d)" % len(g.people_labels),
+      len(g.people_labels)==250)
+
+print("\n[R] a person added mid-index is not lost")
+g,db=make()
+for i in range(250):
+    db.people["p%d"%i]=Person("x", names=[Name("G%d"%i,"S%d"%i)])
+g.build_people_cache()
+cb=GLib._sources[g._index_id]; cb()          # one chunk only
+db.people["late"]=Person("x", names=[Name("Late","Arrival")])
+g.on_people_changed(["late"])                 # person-add during the build
+check("kept while the build is still running",
+      "late" in g.people_labels)
+drain(g)
+check("still present once the build publishes",
+      "late" in g.people_labels)
+check("and reachable in the sorted index",
+      any(h=="late" for _l,h,_s in g.people_cache))
 
 print("\n" + ("ALL PASSED" if not fails else "FAILURES: %s" % fails))
 sys.exit(1 if fails else 0)
