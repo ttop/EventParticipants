@@ -139,12 +139,27 @@ rather than calling the db directly.
 - Type-ahead matches **every word, in any order, against every form of the
   name**. The display format is `LNFN` ("Surname, Given"), so a plain substring
   test failed on the way people actually type — "John Joy" never found
-  "Joy, John Mervyn". Married names are *alternate* names
-  (`NameType.MARRIED`), so the searchable text walks
+  "Joy, John Mervyn". The searchable text walks
   `[get_primary_name()] + get_alternate_names()` and also folds accents;
   `name_displayer.display()` alone only ever sees the primary name.
   Display and search are separate: `COMP_LABEL` is shown, `COMP_SEARCH` is
   matched, and other surnames appear in the label as `Doe, Jane [Smith]`.
+- **A married surname is almost never stored on the person.** Gramps has
+  `NameType.MARRIED` for it, but in this tree exactly 1 person of 2,421 uses
+  one — the surname a woman married into lives only in the family record. So
+  the index also walks `get_family_cursor()` and gives each spouse the other's
+  surname, which is what makes "Louisa Reyman" find `Heitt, Louisa`. It applies
+  in both directions and shows in the label as `[m. Reyman]`, which reads
+  correctly either way: a husband is not known by his wife's surname, but he
+  is married to it. This deliberately widens matching — "John Joy" now also
+  finds a John married to a Joy — and the label says why each row matched.
+- When a search behaviour looks wrong, **check what the tree actually stores**
+  before changing code. The trees are at the paths listed in
+  `~/Library/Application Support/gramps/recent-files-gramps.xml`, and the
+  `sqlite.db` there can be read with plain `sqlite3` + `json` — the person,
+  family and event rows carry a `json_data` column. Opening it
+  `file:...?mode=ro&immutable=1` is safe while Gramps is running. Two rounds
+  of fixing the wrong thing here would have been avoided by looking first.
 
 ## Ideas not yet built
 
