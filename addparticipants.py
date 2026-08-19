@@ -53,6 +53,14 @@ INDEX_CHUNK = 250
 # rows in model order, so the model is rebuilt per keystroke, best first.
 COMPLETION_LIMIT = 40
 
+# Someone demonstrably not alive when the event happened is pushed below
+# everyone plausible rather than hidden. Genealogy dates are routinely wrong
+# or missing, and quietly making a person unreachable is a worse failure than
+# listing them last - the label already shows their dates either way.
+LIFESPAN_PENALTY = 10000
+MAX_LIFESPAN = 110   # years, used when only one of the two dates is known
+DEATH_GRACE = 2      # burials, probate and the like follow a death
+
 STATE_EXISTING = ""
 STATE_NEW = "new"
 STATE_DETACH = "detach"
@@ -110,6 +118,7 @@ class AddParticipants(Gramplet):
         self._index_raw = False     # reading raw data rather than objects
         self._index_years = {}      # event handle -> year, for labels
         self._index_spouses = {}    # person handle -> spouse surnames
+        self._index_lifespan = {}   # person handle -> (birth year, death year)
         self.gui.WIDGET = self.build_gui()
         container = self.gui.get_container_widget()
         if self.gui.textview in container.get_children():
@@ -296,6 +305,7 @@ class AddParticipants(Gramplet):
         self._cancel_index()
         db = self.dbstate.db
         self.people_labels = {}
+        self._index_lifespan = {}
         self._sort_people_cache()
         if db is None or not db.is_open():
             self._show_index_progress(done=True)
@@ -445,6 +455,15 @@ class AddParticipants(Gramplet):
 
     def _raw_person_entry(self, data):
         """(label, folded search text) straight from stored person data."""
+        refs = data["event_ref_list"]
+        years = []
+        for key in ("birth_ref_index", "death_ref_index"):
+            index = data[key]
+            year = 0
+            if index is not None and 0 <= index < len(refs):
+                year = self._index_years.get(refs[index]["ref"], 0)
+            years.append(year)
+        self._index_lifespan[data["handle"]] = tuple(years)
         label = self._raw_person_label(data)
         return label, self._raw_person_search_text(data, label)
 
@@ -555,6 +574,17 @@ class AddParticipants(Gramplet):
 
     def _person_entry(self, person):
         """(display label, folded search text) for one person."""
+        years = []
+        for ref in (person.get_birth_ref(), person.get_death_ref()):
+            year = 0
+            if ref:
+                event = self._get_event(ref.ref)
+                if event:
+                    date = event.get_date_object()
+                    if date:
+                        year = date.get_year() or 0
+            years.append(year)
+        self._index_lifespan[person.get_handle()] = tuple(years)
         label = self._person_label(person)
         return label, self._person_search_text(person, label)
 
@@ -695,6 +725,34 @@ class AddParticipants(Gramplet):
         for label, handle, search in self._matches[:COMPLETION_LIMIT]:
             self.completion_model.append([label, handle, search])
 
+    def _event_year(self):
+        """Year of the selected event, or 0 when it is undated."""
+        if self.event is None:
+            return 0
+        date = self.event.get_date_object()
+        if not date:
+            return 0
+        return date.get_year() or 0
+
+    def _alive_at(self, handle, year):
+        """True, False, or None when the recorded dates cannot say.
+
+        None is the common answer - plenty of people have neither date - and
+        it must never count against them.
+        """
+        birth, death = self._index_lifespan.get(handle, (0, 0))
+        if not birth and not death:
+            return None
+        if birth and year < birth:
+            return False
+        if death and year > death + DEATH_GRACE:
+            return False
+        if birth and not death and year > birth + MAX_LIFESPAN:
+            return False
+        if death and not birth and year < death - MAX_LIFESPAN:
+            return False
+        return True
+
     def _ranked_matches(self, text):
         """(label, handle, search) for every match, best first.
 
@@ -707,6 +765,7 @@ class AddParticipants(Gramplet):
         tokens = _fold(text).split()
         if not tokens:
             return []
+        event_year = self._event_year()
         scored = []
         for label, handle, search in self.people_cache:
             if handle in self._completion_excluded:
@@ -731,6 +790,8 @@ class AddParticipants(Gramplet):
                     if quality > best:
                         best = quality
                 score += best
+            if event_year and self._alive_at(handle, event_year) is False:
+                score -= LIFESPAN_PENALTY
             scored.append((-score, label, handle, search))
         scored.sort()
         return [(label, handle, search) for _s, label, handle, search in scored]
@@ -780,6 +841,12 @@ class AddParticipants(Gramplet):
             )
 
     def stage_person(self, label, handle):
+        # Always take the indexed label rather than whatever was displayed,
+        # so nothing the completion adds for presentation can leak into the
+        # participant list.
+        known = self.people_labels.get(handle)
+        if known:
+            label = known[0]
         for row in self.model:
             if row[COL_HANDLE] == handle and row[COL_KIND] == "Person":
                 # refresh_completion() keeps detach-staged people in the
