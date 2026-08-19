@@ -138,6 +138,7 @@ class AddParticipants(Gramplet):
         role_cell.set_property("editable", True)
         role_cell.set_property("has-entry", True)
         role_cell.connect("edited", self.on_role_edited)
+        role_cell.connect("editing-started", self.on_role_editing_started)
         role_col = Gtk.TreeViewColumn(_("Role"), role_cell, text=COL_ROLE)
         role_col.set_min_width(140)
         tree.append_column(role_col)
@@ -518,6 +519,28 @@ class AddParticipants(Gramplet):
         """Keep the internal token and the visible text in step."""
         row[COL_STATE] = state
         row[COL_STATE_TEXT] = STATE_TEXT[state]
+
+    def on_role_editing_started(self, _cell, editable, _path):
+        """Give the role combo's entry a completion as the edit begins.
+
+        A CellRendererCombo drops down its list but does nothing as you type;
+        the entry only completes if a completion is attached to it, and the
+        editable is built fresh for each edit. Same approach as Gramps' own
+        surname origin column (gui/editors/displaytabs/surnametab.py:279).
+        """
+        entry = editable.get_child() if hasattr(editable, "get_child") else None
+        if not isinstance(entry, Gtk.Entry):
+            return
+        completion = Gtk.EntryCompletion()
+        completion.set_model(self.role_model)
+        completion.set_text_column(0)
+        completion.set_minimum_key_length(1)
+        completion.set_popup_completion(True)
+        # The role list is short and controlled, so filling in the rest of a
+        # prefix is unambiguous and saves typing. Custom roles still work:
+        # carrying on typing replaces the selected completion.
+        completion.set_inline_completion(True)
+        entry.set_completion(completion)
 
     def on_role_edited(self, _cell, path, new_text):
         if not new_text:

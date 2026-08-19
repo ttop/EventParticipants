@@ -19,7 +19,26 @@ class _ListStore:
     def __len__(self): return len(self.rows)
 
 gi=types.ModuleType("gi"); rep=types.ModuleType("gi.repository")
+class _Entry:
+    """Stands in for Gtk.Entry so isinstance() checks are meaningful."""
+    def __init__(self): self.completion=None
+    def set_completion(self,c): self.completion=c
+    def set_width_chars(self,n): pass
+
+class _EntryCompletion:
+    def __init__(self):
+        self.model=None; self.text_column=None; self.min_key=None
+        self.popup=None; self.inline=None
+    def set_model(self,m): self.model=m
+    def set_text_column(self,c): self.text_column=c
+    def set_minimum_key_length(self,n): self.min_key=n
+    def set_popup_completion(self,b): self.popup=b
+    def set_inline_completion(self,b): self.inline=b
+    def set_match_func(self,f,d=None): pass
+    def connect(self,*a): pass
+
 Gtk=types.ModuleType("Gtk"); Gtk.ListStore=_ListStore
+Gtk.Entry=_Entry; Gtk.EntryCompletion=_EntryCompletion
 Pango=types.ModuleType("Pango")
 Pango.Weight=type("W",(),{"NORMAL":400,"BOLD":700})
 Pango.EllipsizeMode=type("E",(),{"END":3})
@@ -309,6 +328,35 @@ lbl = g._person_label(db.people["p2"])
 check("label mentions the married surname: %r" % lbl, "Smith" in lbl)
 check("...and still leads with the primary name: %r" % lbl,
       lbl.startswith("Doe,"))
+
+print("\n[L] the Role column completes as you type")
+g,db=make()
+g.role_model=_ListStore(str)
+g.role_model.append(["Primary"]); g.role_model.append(["Witness"])
+
+class FakeCombo:
+    """The cell editable a CellRendererCombo hands to editing-started."""
+    def __init__(self, child): self._child=child
+    def get_child(self): return self._child
+
+entry=Gtk.Entry()
+g.on_role_editing_started(None, FakeCombo(entry), "0")
+check("a completion is attached to the combo's entry",
+      entry.completion is not None)
+check("it is backed by the live role model",
+      getattr(entry.completion,"model",None) is g.role_model)
+check("it completes from the role column",
+      getattr(entry.completion,"text_column",None)==0)
+check("it pops up from the first character",
+      getattr(entry.completion,"min_key",None)==1)
+
+class OddEditable:
+    def get_child(self): return object()
+try:
+    g.on_role_editing_started(None, OddEditable(), "0")
+    check("an editable with no entry is ignored, not fatal", True)
+except Exception as exc:
+    check("an editable with no entry is ignored, not fatal (%r)"%exc, False)
 
 print("\n" + ("ALL PASSED" if not fails else "FAILURES: %s" % fails))
 sys.exit(1 if fails else 0)

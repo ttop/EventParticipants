@@ -97,6 +97,10 @@ rather than calling the db directly.
   for *shared* events (Primary is the default for events *added* in the Person
   editor, which is a different operation).
 - Roles are editable per row, with a combo backed by standard + custom roles.
+  A `CellRendererCombo` drops down its list but does **not** complete as you
+  type, and the editable is rebuilt for every edit, so the completion is
+  attached in an `editing-started` handler — the same approach Gramps uses
+  for its surname origin column (`gui/editors/displaytabs/surnametab.py:279`).
 - Families are included as participants, not just people — a marriage event is
   referenced by the Family object, so a person-only list would be misleading.
   Detaching a family drops both spouses at once; that's correct but blunt.
