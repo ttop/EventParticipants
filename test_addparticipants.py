@@ -114,6 +114,11 @@ class _Displayer:
     def display(person): return person.get_primary_name().display()
     @staticmethod
     def display_name(name): return name.display() if name else ""
+    @staticmethod
+    def raw_display_name(raw):
+        """Same LNFN formatting, but from stored data instead of a Name."""
+        surname=" ".join(x["surname"] for x in raw["surname_list"] if x["surname"])
+        return ("%s, %s" % (surname, raw["first_name"])).strip().strip(",").strip()
 
 _mod("gramps.gen.display")
 _mod("gramps.gen.display.name", displayer=_Displayer())
@@ -129,12 +134,12 @@ class Ref:
     def __init__(self,ref,role=None): self.ref=ref; self.role=role
     def set_role(self,r): self.role=r
 class _Date:
-    def __init__(self,s): self.s=s
+    def __init__(self,s,year=0): self.s=s; self.year=year
     def get_sort_value(self): return self.s
-    def get_year(self): return 1900
+    def get_year(self): return self.year
 class Ev:
-    def __init__(self,s): self._s=s
-    def get_date_object(self): return _Date(self._s)
+    def __init__(self,s,year=0): self._s=s; self._y=year
+    def get_date_object(self): return _Date(self._s,self._y)
 class Person:
     def __init__(self,name,b=None,d=None,refs=None,names=None):
         self.name=name; self._b=b; self._d=d; self.refs=refs or []
@@ -148,9 +153,44 @@ class Person:
     def get_event_ref_list(self): return self.refs
     def set_event_ref_list(self,r): self.refs=r
     def get_handle(self): return self.handle
+def _raw_name(n):
+    """A Name stub rendered as the dict the database actually stores."""
+    if n.raw is not None:
+        return {"display_as":0,"first_name":"","call":"","nick":"",
+                "surname_list":[{"surname":n.raw,"prefix":""}]}
+    return {"display_as":0,"first_name":n.given,"call":n.call,"nick":n.nick,
+            "surname_list":[{"surname":n.surname,"prefix":""}]}
+
+class _Cursor:
+    """Mimics gen.db.generic.Cursor: yields (handle, raw data)."""
+    def __init__(self, rows): self.rows=rows
+    def __enter__(self): return self
+    def __exit__(self,*a): return False
+    def __iter__(self):
+        for d in self.rows: yield (d["handle"], d)
+
 class FakeDb:
     def __init__(self):
         self.people={}; self.events={}; self.families={}; self.emitted=[]
+    def _ref_index(self, person, handle):
+        for i,r in enumerate(person.refs):
+            if r.ref==handle: return i
+        return -1
+    def _raw_person(self, handle, p):
+        names = p._names or [Name(raw=p.name)]
+        return {"handle":handle,
+                "primary_name":_raw_name(names[0]),
+                "alternate_names":[_raw_name(n) for n in names[1:]],
+                "event_ref_list":[{"ref":r.ref} for r in p.refs],
+                "birth_ref_index":self._ref_index(p,p._b),
+                "death_ref_index":self._ref_index(p,p._d)}
+    def get_person_cursor(self):
+        return _Cursor([self._raw_person(h,p) for h,p in self.people.items()])
+    def get_event_cursor(self):
+        return _Cursor([{"handle":h,
+                         "date":{"dateval":[0,0,
+                                 e.get_date_object().get_year(),False]}}
+                        for h,e in self.events.items()])
     def emit(self, signal, args): self.emitted.append((signal, args))
     def get_person_handles(self, sort_handles=False): return list(self.people)
     def is_open(self): return True
@@ -469,6 +509,40 @@ check("still present once the build publishes",
       "late" in g.people_labels)
 check("and reachable in the sorted index",
       any(h=="late" for _l,h,_s in g.people_cache))
+
+print("\n[S] raw indexing and the object path agree exactly")
+names=[Name("Jane","Doe"), Name("Jane","Smith",ntype=3)]
+
+def indexed(force_object):
+    g,db=make()
+    db.events["E1"]=Ev(0,1901); db.events["E2"]=Ev(0,1980)
+    db.people["p1"]=Person("x", names=names, b="E1", d="E2",
+                           refs=[Ref("E1"),Ref("E2")])
+    if force_object:
+        def boom(): raise RuntimeError("no cursor here")
+        db.get_person_cursor=boom
+    g.build_people_cache(); drain(g)
+    return g, g.people_labels.get("p1")
+
+g_raw, raw_entry = indexed(force_object=False)
+g_obj, obj_entry = indexed(force_object=True)
+check("raw path used a cursor", g_raw._index_raw is True)
+check("object path fell back", g_obj._index_raw is False)
+check("both produced an entry", raw_entry is not None and obj_entry is not None)
+check("labels identical: %r" % (raw_entry[0],), raw_entry[0]==obj_entry[0])
+check("search text identical", raw_entry[1]==obj_entry[1])
+check("years came through the year map", 
+      "1901" in raw_entry[0] and "1980" in raw_entry[0])
+check("married surname still annotated", "[Smith]" in raw_entry[0])
+
+print("\n[T] a broken raw layout degrades instead of emptying the index")
+g,db=make()
+db.people["p1"]=Person("x", names=[Name("Ann","Lee")])
+db.get_person_cursor=lambda: _Cursor([{"handle":"p1","primary_name":None}])
+g.build_people_cache(); drain(g)
+check("fell back to the object API", g._index_raw is False)
+check("and still indexed the person (%d)" % len(g.people_labels),
+      len(g.people_labels)==1)
 
 print("\n" + ("ALL PASSED" if not fails else "FAILURES: %s" % fails))
 sys.exit(1 if fails else 0)
