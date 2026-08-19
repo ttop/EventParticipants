@@ -47,7 +47,7 @@ COMP_SEARCH = 2    # folded text the matcher searches, never displayed
 # People absorbed into the name index per idle turn. The index costs two
 # database reads per person for the birth and death years, so on a few
 # thousand people it must not run in one go on the main loop.
-INDEX_CHUNK = 100
+INDEX_CHUNK = 250
 
 STATE_EXISTING = ""
 STATE_NEW = "new"
@@ -60,6 +60,19 @@ STATE_TEXT = {
     STATE_NEW: _("new"),
     STATE_DETACH: _("detach"),
 }
+
+
+def _raw_surname(name_data):
+    """Approximate SurnameBase.get_surname() from raw data."""
+    parts = []
+    for surname in name_data["surname_list"]:
+        value = surname["surname"]
+        prefix = surname["prefix"]
+        if prefix and value:
+            value = "%s %s" % (prefix, value)
+        if value:
+            parts.append(value)
+    return " ".join(parts)
 
 
 def _fold(text):
@@ -89,6 +102,8 @@ class AddParticipants(Gramplet):
         self._completion_excluded = None
         self._index_id = 0          # idle source building the name index
         self._index_iter = None
+        self._index_raw = False     # reading raw data rather than objects
+        self._index_years = {}      # event handle -> year, for labels
         self.gui.WIDGET = self.build_gui()
         container = self.gui.get_container_widget()
         if self.gui.textview in container.get_children():
@@ -276,16 +291,34 @@ class AddParticipants(Gramplet):
         if db is None or not db.is_open():
             self._show_index_progress(done=True)
             return
-        # Snapshot the handles rather than holding iter_people() open: that
-        # keeps a database cursor alive across idle turns while the user is
-        # free to edit the tree. Handles are just strings, and any that go
-        # stale simply resolve to None below.
+        # Prefer raw data. Building labels through the object API costs a
+        # query and a full Event construction for each of the birth and death
+        # years, plus a Person construction each - thousands of queries and
+        # object builds. The cursors stream the whole table in one query and
+        # hand over the stored dicts, so the years become a lookup and no
+        # Person or Event is ever constructed.
+        self._index_raw = True
+        self._index_years = {}
         try:
-            handles = list(db.get_person_handles())
+            self._index_years = self._build_year_map(db)
+            with db.get_person_cursor() as cursor:
+                rows = [data for _handle, data in cursor]
+            if rows:
+                # Prove the raw layout before committing to it, so a changed
+                # field name degrades to the object API instead of silently
+                # producing an empty index.
+                self._raw_person_entry(rows[0])
+            self._index_iter = iter(rows)
         except Exception:
-            LOG.debug("get_person_handles unavailable", exc_info=True)
-            handles = [person.get_handle() for person in db.iter_people()]
-        self._index_iter = iter(handles)
+            LOG.debug("raw indexing unavailable; using the object API",
+                      exc_info=True)
+            self._index_raw = False
+            self._index_years = {}
+            try:
+                handles = list(db.get_person_handles())
+            except Exception:
+                handles = [person.get_handle() for person in db.iter_people()]
+            self._index_iter = iter(handles)
         self._index_id = GLib.idle_add(
             self._index_chunk, priority=GLib.PRIORITY_LOW
         )
@@ -304,10 +337,13 @@ class AddParticipants(Gramplet):
             self._index_id = 0
             return False
         absorbed = 0
-        for handle in self._index_iter:
-            person = self._get_person(handle)
-            if person is not None:
-                self.people_labels[handle] = self._person_entry(person)
+        for item in self._index_iter:
+            if self._index_raw:
+                self.people_labels[item["handle"]] = self._raw_person_entry(item)
+            else:
+                person = self._get_person(item)
+                if person is not None:
+                    self.people_labels[item] = self._person_entry(person)
             absorbed += 1
             if absorbed >= INDEX_CHUNK:
                 self._show_index_progress(done=False)
@@ -318,6 +354,64 @@ class AddParticipants(Gramplet):
         self._sort_people_cache()
         self._show_index_progress(done=True)
         return False
+
+    def _build_year_map(self, db):
+        """Event handle -> year, for every dated event, in a single query."""
+        years = {}
+        with db.get_event_cursor() as cursor:
+            for _handle, data in cursor:
+                date = data["date"]
+                if not date:
+                    continue
+                dateval = date["dateval"]
+                if not dateval or len(dateval) <= 2:
+                    continue
+                year = dateval[2]
+                if year:
+                    years[data["handle"]] = year
+        return years
+
+    def _raw_person_entry(self, data):
+        """(label, folded search text) straight from stored person data."""
+        label = self._raw_person_label(data)
+        return label, self._raw_person_search_text(data, label)
+
+    def _raw_person_label(self, data):
+        """The object path's _person_label, without building a Person."""
+        name = name_displayer.raw_display_name(data["primary_name"])
+        primary_surname = _raw_surname(data["primary_name"])
+        others = []
+        for alt in data["alternate_names"]:
+            surname = _raw_surname(alt)
+            if surname and surname != primary_surname and surname not in others:
+                others.append(surname)
+        years = []
+        refs = data["event_ref_list"]
+        for key, marker in (("birth_ref_index", "b."),
+                            ("death_ref_index", "d.")):
+            index = data[key]
+            if index is None or index < 0 or index >= len(refs):
+                continue
+            year = self._index_years.get(refs[index]["ref"])
+            if year:
+                years.append("%s %d" % (marker, year))
+        label = name
+        if others:
+            label += " [%s]" % ", ".join(others)
+        if years:
+            label += " (%s)" % " ".join(years)
+        return label
+
+    def _raw_person_search_text(self, data, label):
+        """The object path's _person_search_text, from stored data."""
+        parts = [label]
+        for name_data in [data["primary_name"]] + list(data["alternate_names"]):
+            parts.append(name_displayer.raw_display_name(name_data))
+            parts.append(name_data["first_name"])
+            parts.append(_raw_surname(name_data))
+            parts.append(name_data["call"])
+            parts.append(name_data["nick"])
+        return _fold(" ".join(part for part in parts if part))
 
     def _show_index_progress(self, done):
         """Say so in the search box while the index is still filling."""

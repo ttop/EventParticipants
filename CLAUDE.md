@@ -99,14 +99,24 @@ rather than calling the db directly.
   whose role `is_primary()` (`gen/utils/db.py:274`), so anyone added with
   Unknown never appeared in that column at all. Visibility beats matching
   stock here. Change this back only with a plan for that column.
-- The name index is built **in the background**, `INDEX_CHUNK` people per
-  GLib idle turn, and the search box shows "Indexing names..." until it is
-  done. Indexing costs two database reads per person for the birth and death
-  years, so on a few thousand people a single pass blocks the main loop and
-  the search box silently matches nothing — which is exactly how it was first
-  reported. The build snapshots `get_person_handles()` rather than holding
-  `iter_people()` open, because that keeps a database cursor alive across
-  idle turns while the user can still edit the tree.
+- The name index is built from **raw stored data, not objects**, and in the
+  background. Going through the object API cost a point query and a full
+  `Event` build for each of the birth and death years plus a `Person` build
+  each — 7,200 queries and 7,200 objects on a 2,400-person tree, which is why
+  it was first reported as "typing a name matches no one". `get_event_cursor()`
+  and `get_person_cursor()` stream whole tables in one query each and hand
+  over the stored dicts (`DataDict`, both attribute- and key-accessible), so
+  the years become a dict lookup: **two cursor scans, no point queries, no
+  objects**. Field names come from the `get_schema()` definitions, and
+  `Date._POS_YR` is 2 in `dateval`.
+- That binds to the stored layout, so `build_people_cache()` proves the raw
+  path on the first row and falls back to the object API on any exception.
+  Keep that guard: a silent failure here empties the index and the search box
+  just stops matching, with nothing to say why.
+- Labels are still built `INDEX_CHUNK` people per GLib idle turn, and the
+  search box shows "Indexing names..." until it is done. `test_addparticipants.py`
+  asserts the raw and object paths produce byte-identical labels and search
+  text — if you touch either, keep that test honest.
 - Applying emits `event-update` for the event afterwards. The event object
   itself is never modified, so nothing else invalidates the Events view's
   cached participant column. That view does watch `person-update`, but its
