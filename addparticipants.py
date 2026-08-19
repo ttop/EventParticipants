@@ -14,7 +14,7 @@ import re
 import unicodedata
 from xml.sax.saxutils import escape as xml_escape
 
-from gi.repository import Gtk, Pango
+from gi.repository import GLib, Gtk, Pango
 
 from gramps.gen.plug import Gramplet
 from gramps.gen.lib import EventRef, EventRoleType
@@ -43,6 +43,11 @@ COL_STATE_TEXT = 8  # translated text for the state column
 COMP_LABEL = 0
 COMP_HANDLE = 1
 COMP_SEARCH = 2    # folded text the matcher searches, never displayed
+
+# People absorbed into the name index per idle turn. The index costs two
+# database reads per person for the birth and death years, so on a few
+# thousand people it must not run in one go on the main loop.
+INDEX_CHUNK = 100
 
 STATE_EXISTING = ""
 STATE_NEW = "new"
@@ -79,9 +84,11 @@ class AddParticipants(Gramplet):
     def init(self):
         self.event = None
         self.event_handle = None
-        self.people_cache = []      # sorted list of (label, handle)
-        self.people_labels = {}     # handle -> label
+        self.people_cache = []      # sorted list of (label, handle, search)
+        self.people_labels = {}     # handle -> (label, search)
         self._completion_excluded = None
+        self._index_id = 0          # idle source building the name index
+        self._index_iter = None
         self.gui.WIDGET = self.build_gui()
         container = self.gui.get_container_widget()
         if self.gui.textview in container.get_children():
@@ -225,6 +232,11 @@ class AddParticipants(Gramplet):
                 person = self._get_person(handle)
                 if person is not None:
                     self.people_labels[handle] = self._person_entry(person)
+        if self._index_id:
+            # A build is in flight; it publishes the sorted list when it
+            # finishes, so skip the expensive re-sort but keep the change -
+            # iter_people() may already be past this person.
+            return
         self._sort_people_cache()
 
     # Gramps raises HandleError for a dangling handle rather than returning
@@ -250,15 +262,73 @@ class AddParticipants(Gramplet):
             return None
 
     def build_people_cache(self):
-        """Load every person once into memory as handle -> label."""
+        """Start rebuilding the name index in the background.
+
+        Indexing costs two database reads per person for the birth and death
+        years, so on a few thousand people doing it in one pass blocks the
+        main loop: the search box sits there matching nothing, with no sign
+        that anything is happening.
+        """
+        self._cancel_index()
         db = self.dbstate.db
         self.people_labels = {}
-        if db is not None and db.is_open():
-            for person in db.iter_people():
-                self.people_labels[person.get_handle()] = self._person_entry(
-                    person
-                )
         self._sort_people_cache()
+        if db is None or not db.is_open():
+            self._show_index_progress(done=True)
+            return
+        # Snapshot the handles rather than holding iter_people() open: that
+        # keeps a database cursor alive across idle turns while the user is
+        # free to edit the tree. Handles are just strings, and any that go
+        # stale simply resolve to None below.
+        try:
+            handles = list(db.get_person_handles())
+        except Exception:
+            LOG.debug("get_person_handles unavailable", exc_info=True)
+            handles = [person.get_handle() for person in db.iter_people()]
+        self._index_iter = iter(handles)
+        self._index_id = GLib.idle_add(
+            self._index_chunk, priority=GLib.PRIORITY_LOW
+        )
+        self._show_index_progress(done=False)
+
+    def _cancel_index(self):
+        """Drop any in-flight index build, e.g. when the tree changes."""
+        if self._index_id:
+            GLib.source_remove(self._index_id)
+        self._index_id = 0
+        self._index_iter = None
+
+    def _index_chunk(self):
+        """Absorb one slice of people, then yield back to the main loop."""
+        if self._index_iter is None:
+            self._index_id = 0
+            return False
+        absorbed = 0
+        for handle in self._index_iter:
+            person = self._get_person(handle)
+            if person is not None:
+                self.people_labels[handle] = self._person_entry(person)
+            absorbed += 1
+            if absorbed >= INDEX_CHUNK:
+                self._show_index_progress(done=False)
+                return True
+        # Exhausted: publish the finished index.
+        self._index_id = 0
+        self._index_iter = None
+        self._sort_people_cache()
+        self._show_index_progress(done=True)
+        return False
+
+    def _show_index_progress(self, done):
+        """Say so in the search box while the index is still filling."""
+        if done:
+            self.entry.set_placeholder_text(
+                _("Type a name to add someone...")
+            )
+        else:
+            self.entry.set_placeholder_text(
+                _("Indexing names... %d so far") % len(self.people_labels)
+            )
 
     def _sort_people_cache(self):
         """Derive the sorted (label, handle) list the completion reads."""
