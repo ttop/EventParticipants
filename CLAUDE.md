@@ -21,6 +21,11 @@ that prompted this project.
 - `addparticipants.gpr.py` — plugin registration. `navtypes=["Event"]`,
   `gramps_target_version="6.0"`.
 - `addparticipants.py` — the `AddParticipants(Gramplet)` class, all of it.
+- `LICENSE` — GPL v2. Gramps is GPL v2-or-later and this gramplet subclasses
+  `gen.plug.Gramplet` and imports `gen.lib`, `gen.db` and friends, so it is a
+  derivative work: distributing it means GPL-compatible terms. Every bundled
+  Gramps plugin with code in it carries the same header, as does every
+  third-party addon installed here. Keep the per-file headers in step with it.
 - `test_addparticipants.py` — logic tests. Gramps embeds libpython and ships
   no interpreter, so these stub out Gramps and GTK and cover the plain logic
   only. `python3 test_addparticipants.py`, no framework needed. They do not
