@@ -150,7 +150,17 @@ rather than calling the db directly.
   `[get_primary_name()] + get_alternate_names()` and also folds accents;
   `name_displayer.display()` alone only ever sees the primary name.
   Display and search are separate: `COMP_LABEL` is shown, `COMP_SEARCH` is
-  matched, and other surnames appear in the label as `Doe, Jane [Smith]`.
+  matched.
+- **Anything that can make a person match must be visible in the label**,
+  otherwise a correct match looks like a bug — searching "Loretta" returned
+  "Casey, Lura Ruth" with no hint that Loretta is an alternate given name she
+  is recorded under. `_other_names()` puts all three kinds in one bracket and
+  keeps them distinguishable: a bare alternate surname, `aka <given name>`,
+  and `m. <surname>` for one reached by marriage —
+  `Doe, Jane [Smith, aka Janie, m. Brown]`. In this tree 153 people carry an
+  alias, and 156 alternate names add *only* a given name, so leaving those
+  unlabelled hid the reason for most alias matches. If a future change adds
+  another searchable field, annotate it here too.
 - **Type-ahead results are ranked, so the model is rebuilt per keystroke.**
   `GtkEntryCompletion` filters but never reorders — it shows model rows in
   model order — so an alphabetical model put `Johnson, Bonnie [m. Joy]` above
