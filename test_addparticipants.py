@@ -716,5 +716,38 @@ g.stage_person("Ann Lee -- DECORATED", "p1")
 check("participant row shows the real label: %r" % g.model[0][ap.COL_NAME],
       g.model[0][ap.COL_NAME]=="Lee, Ann")
 
+print("\n[AA] an alternate given name is visible, not just matchable")
+# Lura Ruth Casey is also recorded as Loretta, with no surname of its own.
+# Searching "Loretta" found her but the label gave no hint why.
+g,db=make()
+db.people["lura"]=Person("x", names=[Name("Lura Ruth","Casey"),
+                                     Name("Loretta","")])
+g.build_people_cache(); drain(g)
+label=g.people_labels["lura"][0]
+check("'Loretta' still finds her",
+      any(h=="lura" for _l,h,_s in g._ranked_matches("Loretta")))
+check("and the label now says why: %r" % label, "Loretta" in label)
+check("marked as an alias, not as a surname: %r" % label, "aka Loretta" in label)
+check("her own name still leads: %r" % label, label.startswith("Casey, Lura Ruth"))
+check("searching her real name still works",
+      any(h=="lura" for _l,h,_s in g._ranked_matches("Lura Casey")))
+
+# an alternate that only repeats the primary given name adds nothing
+g,db=make()
+db.people["p1"]=Person("x", names=[Name("Ann","Lee"), Name("Ann","Lee")])
+g.build_people_cache(); drain(g)
+check("a duplicate alternate adds no clutter: %r" % g.people_labels["p1"][0],
+      g.people_labels["p1"][0]=="Lee, Ann")
+
+# all three annotation kinds can coexist and stay distinguishable
+g,db=make()
+db.people["w"]=Person("x", names=[Name("Jane","Doe"), Name("Janie","Smith")])
+db.people["h"]=Person("x", names=[Name("Bob","Brown")])
+db.raw_families=[{"handle":"f1","father_handle":"h","mother_handle":"w"}]
+g.build_people_cache(); drain(g)
+lab=g.people_labels["w"][0]
+check("surname, alias and marriage all shown: %r" % lab,
+      "Smith" in lab and "aka Janie" in lab and "m. Brown" in lab)
+
 print("\n" + ("ALL PASSED" if not fails else "FAILURES: %s" % fails))
 sys.exit(1 if fails else 0)

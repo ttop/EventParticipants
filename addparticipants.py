@@ -440,22 +440,30 @@ class AddParticipants(Gramplet):
                     spouses.setdefault(mother, set()).add(surname)
         return {handle: sorted(names) for handle, names in spouses.items()}
 
-    def _other_surnames(self, handle, primary_surname, alternates):
-        """Surnames worth showing besides the primary one.
+    def _other_names(self, handle, primary_given, primary_surname,
+                     alt_givens, alt_surnames):
+        """Every other name this person answers to, for the label.
 
-        Alternate surnames appear as they are; a surname reached by marriage
-        is prefixed "m." so it reads correctly in both directions - a husband
-        is not known by his wife's surname, but he is married to it.
+        Anything here can make the person match, so it has to be visible:
+        otherwise searching "Loretta" turns up "Casey, Lura Ruth" with no
+        indication of why. Alternate surnames appear as they are, an
+        alternate given name is marked "aka", and a surname reached by
+        marriage is marked "m." - which reads correctly for a husband too,
+        since he is not known by his wife's surname but is married to it.
         """
         others = []
-        for surname in alternates:
+        for surname in alt_surnames:
             if surname and surname != primary_surname and surname not in others:
                 others.append(surname)
-        for surname in self._index_spouses.get(handle, ()):
-            marked = _("m. %s") % surname  # married into, not her own
-            if surname != primary_surname and surname not in others:
+        for given in alt_givens:
+            if given and given != primary_given:
+                marked = _("aka %s") % given
                 if marked not in others:
                     others.append(marked)
+        for surname in self._index_spouses.get(handle, ()):
+            marked = _("m. %s") % surname  # married into, not her own
+            if surname != primary_surname and marked not in others:
+                others.append(marked)
         return others
 
     def _raw_person_entry(self, data):
@@ -474,11 +482,14 @@ class AddParticipants(Gramplet):
 
     def _raw_person_label(self, data):
         """The object path's _person_label, without building a Person."""
-        name = name_displayer.raw_display_name(data["primary_name"])
-        primary_surname = _raw_surname(data["primary_name"])
-        others = self._other_surnames(
-            data["handle"], primary_surname,
-            [_raw_surname(alt) for alt in data["alternate_names"]],
+        primary = data["primary_name"]
+        alternates = data["alternate_names"]
+        name = name_displayer.raw_display_name(primary)
+        primary_surname = _raw_surname(primary)
+        others = self._other_names(
+            data["handle"], primary["first_name"], primary_surname,
+            [alt["first_name"] for alt in alternates],
+            [_raw_surname(alt) for alt in alternates],
         )
         years = []
         refs = data["event_ref_list"]
@@ -535,9 +546,12 @@ class AddParticipants(Gramplet):
         name = name_displayer.display(person)
         primary = person.get_primary_name()
         primary_surname = primary.get_surname() if primary else ""
-        others = self._other_surnames(
-            person.get_handle(), primary_surname,
-            [alt.get_surname() for alt in person.get_alternate_names()],
+        primary_given = primary.get_first_name() if primary else ""
+        alternates = person.get_alternate_names()
+        others = self._other_names(
+            person.get_handle(), primary_given, primary_surname,
+            [alt.get_first_name() for alt in alternates],
+            [alt.get_surname() for alt in alternates],
         )
         years = []
         for ref, marker in (
