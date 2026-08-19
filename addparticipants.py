@@ -351,8 +351,14 @@ class AddParticipants(Gramplet):
             self.role_model.append([name])
 
     def _default_role(self):
-        """Unknown, matching stock Gramps behaviour for shared events."""
-        return str(EventRoleType(EventRoleType.UNKNOWN))
+        """Primary, so the participant shows up where people look for it.
+
+        Stock Gramps defaults a *shared* event to Unknown, but the Events
+        view's Main Participants column only counts references whose role
+        is_primary() (gen/utils/db.py:274). Defaulting to Unknown meant a
+        person added here never appeared in that column at all.
+        """
+        return str(EventRoleType(EventRoleType.PRIMARY))
 
     # ------------------------------------------------------------------
     # Active event tracking
@@ -676,6 +682,17 @@ class AddParticipants(Gramplet):
             self.status.set_text(message)
             self.uistate.push_message(self.dbstate, message)
             return
+
+        # The event object itself never changed, so nothing has told the
+        # Events view that its cached Main Participants column is stale.
+        # That view does watch person-update, but its handler walks each
+        # person's *current* event refs (plugins/view/eventview.py:156), so
+        # it cannot see a reference we just removed. Nudge the row directly;
+        # this covers additions, role changes and detachments alike.
+        try:
+            db.emit("event-update", ([ev_handle],))
+        except Exception:
+            LOG.debug("could not emit event-update", exc_info=True)
 
         self.load_participants()
         self.refresh_completion()

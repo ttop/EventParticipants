@@ -93,9 +93,18 @@ rather than calling the db directly.
 
 ## Design decisions already made
 
-- New participants default to role **Unknown**, matching stock Gramps behaviour
-  for *shared* events (Primary is the default for events *added* in the Person
-  editor, which is a different operation).
+- New participants default to role **Primary**. Stock Gramps defaults a
+  *shared* event to Unknown, and this addon did too until it was used in
+  anger: the Events view's Main Participants column only counts references
+  whose role `is_primary()` (`gen/utils/db.py:274`), so anyone added with
+  Unknown never appeared in that column at all. Visibility beats matching
+  stock here. Change this back only with a plan for that column.
+- Applying emits `event-update` for the event afterwards. The event object
+  itself is never modified, so nothing else invalidates the Events view's
+  cached participant column. That view does watch `person-update`, but its
+  handler walks each person's *current* event refs
+  (`plugins/view/eventview.py:156`), which by construction cannot see a
+  reference that was just removed — so detachments never refreshed.
 - Roles are editable per row, with a combo backed by standard + custom roles.
   A `CellRendererCombo` drops down its list but does **not** complete as you
   type, and the editable is rebuilt for every edit, so the completion is

@@ -51,10 +51,14 @@ def _mod(n,**a):
     m=types.ModuleType(n); m.__dict__.update(a); sys.modules[n]=m; return m
 
 class EventRoleType:
-    UNKNOWN=-1
+    UNKNOWN=-1; CUSTOM=0; PRIMARY=1; CELEBRANT=3; WITNESS=7; FAMILY=8
+    _NAMES={-1:"Unknown",0:"Custom",1:"Primary",3:"Celebrant",7:"Witness",8:"Family"}
     def __init__(self,v=None): self.v=v
-    def __str__(self): return "Unknown" if self.v in (None,-1) else str(self.v)
+    def __str__(self):
+        if isinstance(self.v,str): return self.v
+        return self._NAMES.get(self.v,"Unknown")
     def __eq__(self,o): return str(self)==str(o)
+    def is_primary(self): return self.v==self.PRIMARY
     def get_standard_names(self): return ["Primary","Witness","Unknown"]
 class EventRef:
     def __init__(self): self.ref=None; self.role=None
@@ -126,7 +130,9 @@ class Person:
     def set_event_ref_list(self,r): self.refs=r
     def get_handle(self): return self.handle
 class FakeDb:
-    def __init__(self): self.people={}; self.events={}; self.families={}
+    def __init__(self):
+        self.people={}; self.events={}; self.families={}; self.emitted=[]
+    def emit(self, signal, args): self.emitted.append((signal, args))
     def is_open(self): return True
     def iter_people(self):
         for h,p in self.people.items(): p.handle=h; yield p
@@ -357,6 +363,42 @@ try:
     check("an editable with no entry is ignored, not fatal", True)
 except Exception as exc:
     check("an editable with no entry is ignored, not fatal (%r)"%exc, False)
+
+print("\n[M] new participants default to Primary")
+g,db=make()
+check("_default_role() is 'Primary', got %r" % g._default_role(),
+      g._default_role()=="Primary")
+g.stage_person("Newcomer","pN")
+check("a staged row carries Primary, got %r" % g.model[0][ap.COL_ROLE],
+      g.model[0][ap.COL_ROLE]=="Primary")
+check("...which is what the Main Participants column counts",
+      EventRoleType(EventRoleType.PRIMARY).is_primary())
+
+print("\n[N] Apply nudges the Events view to re-read the row")
+g,db=make()
+p=Person("Ann",refs=[])
+db.people["p1"]=p; db.events["E1"]=Ev(500)
+g.event=Ev(500); g.event.get_handle=lambda:"E1"
+g.model.append(row("Ann","Primary",ap.STATE_NEW,"p1","Person","",-1))
+g.load_participants=lambda:None; g.refresh_completion=lambda force=False:None
+g.update_status=lambda:None
+g.on_apply(None)
+check("the reference was actually added", len(p.refs)==1)
+check("event-update emitted for this event, got %r" % db.emitted,
+      ("event-update",(["E1"],)) in db.emitted)
+
+print("\n[O] the nudge also happens on detach, which stock Gramps misses")
+g,db=make()
+p=Person("Bea",refs=[Ref("E1","Primary")])
+db.people["p1"]=p; db.events["E1"]=Ev(500)
+g.event=Ev(500); g.event.get_handle=lambda:"E1"
+g.model.append(row("Bea","Primary",ap.STATE_DETACH,"p1","Person","Primary",0))
+g.load_participants=lambda:None; g.refresh_completion=lambda force=False:None
+g.update_status=lambda:None
+g.on_apply(None)
+check("the reference was removed", len(p.refs)==0)
+check("event-update still emitted, got %r" % db.emitted,
+      ("event-update",(["E1"],)) in db.emitted)
 
 print("\n" + ("ALL PASSED" if not fails else "FAILURES: %s" % fails))
 sys.exit(1 if fails else 0)
