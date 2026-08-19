@@ -389,10 +389,15 @@ class AddParticipants(Gramplet):
         the surname they married into has to come from here rather than from
         their alternate names.
 
-        This runs one way only, from the father's surname to the mother. The
-        surname is not exchanged - a husband is not findable under his wife's
-        maiden name - and matching both directions turned a search for
-        "John Joy" into every John married to a Joy.
+        A Gramps Family record is a couple, and its two spouse slots are
+        named father_handle and mother_handle whether or not there are any
+        children. So this reads "the husband's surname, given to the wife".
+        Children sit in child_ref_list and get nothing from it.
+
+        One direction only: wives are known by their husbands' surnames and
+        not the reverse, so the surname is never exchanged - a husband must
+        not become findable under his wife's maiden name. Matching both ways
+        turned a search for "John Joy" into every John married to a Joy.
         """
         if surname_by_handle is None:
             surname_by_handle = {
