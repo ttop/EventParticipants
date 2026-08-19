@@ -49,6 +49,10 @@ COMP_SEARCH = 2    # folded text the matcher searches, never displayed
 # thousand people it must not run in one go on the main loop.
 INDEX_CHUNK = 250
 
+# Most rows the type-ahead will offer at once. GtkEntryCompletion shows model
+# rows in model order, so the model is rebuilt per keystroke, best first.
+COMPLETION_LIMIT = 40
+
 STATE_EXISTING = ""
 STATE_NEW = "new"
 STATE_DETACH = "detach"
@@ -99,7 +103,8 @@ class AddParticipants(Gramplet):
         self.event_handle = None
         self.people_cache = []      # sorted list of (label, handle, search)
         self.people_labels = {}     # handle -> (label, search)
-        self._completion_excluded = None
+        self._completion_excluded = frozenset()
+        self._matches = []          # ranked (label, handle) for the typed text
         self._index_id = 0          # idle source building the name index
         self._index_iter = None
         self._index_raw = False     # reading raw data rather than objects
@@ -136,6 +141,9 @@ class AddParticipants(Gramplet):
         self.entry.set_placeholder_text(_("Type a name to add someone..."))
         self.entry.set_completion(completion)
         self.entry.connect("activate", self.on_entry_activate)
+        # Connected after set_completion so GTK's own handler runs first and
+        # then sees the reordered model.
+        self.entry.connect("changed", self._update_completion)
         vbox.pack_start(self.entry, False, False, 0)
 
         # --- Participants ---
@@ -658,7 +666,7 @@ class AddParticipants(Gramplet):
                 )
 
     def refresh_completion(self, force=False):
-        """Rebuild the type-ahead model, excluding anyone already listed.
+        """Note who is already listed and refresh what the type-ahead offers.
 
         This runs on every event selection, so skip the work unless the set
         of excluded people actually moved. Callers that changed the people
@@ -672,11 +680,60 @@ class AddParticipants(Gramplet):
         if not force and listed == self._completion_excluded:
             return
         self._completion_excluded = listed
+        self._update_completion()
+
+    def _update_completion(self, *_):
+        """Refill the type-ahead with the best matches for what is typed.
+
+        GtkEntryCompletion filters but never reorders: it shows model rows in
+        model order. Ranking therefore means rebuilding the model itself,
+        which also keeps the popup to a readable size.
+        """
+        text = self.entry.get_text().strip()
+        self._matches = self._ranked_matches(text) if text else []
         self.completion_model.clear()
-        for label, handle, search in self.people_cache:
-            if handle in listed:
-                continue
+        for label, handle, search in self._matches[:COMPLETION_LIMIT]:
             self.completion_model.append([label, handle, search])
+
+    def _ranked_matches(self, text):
+        """(label, handle, search) for every match, best first.
+
+        Scoring is per typed word against the words of the indexed text:
+        landing on a whole word beats starting one, which beats appearing in
+        the middle of one, and hits early in the text - where the person's own
+        name lives, ahead of alternate and married surnames - count for more.
+        So "John Joy" puts "Joy, John Mervyn" above "Johnson, Bonnie [m. Joy]".
+        """
+        tokens = _fold(text).split()
+        if not tokens:
+            return []
+        scored = []
+        for label, handle, search in self.people_cache:
+            if handle in self._completion_excluded:
+                continue
+            # Cheap reject first; only survivors are worth scoring.
+            if not all(token in search for token in tokens):
+                continue
+            words = search.split()
+            score = 0
+            for token in tokens:
+                best = 0
+                for position, word in enumerate(words):
+                    if word == token:
+                        quality = 100
+                    elif word.startswith(token):
+                        quality = 60
+                    elif token in word:
+                        quality = 25
+                    else:
+                        continue
+                    quality += max(0, 20 - position)
+                    if quality > best:
+                        best = quality
+                score += best
+            scored.append((-score, label, handle, search))
+        scored.sort()
+        return [(label, handle, search) for _s, label, handle, search in scored]
 
     @staticmethod
     def _match_func(completion, key, treeiter, _data):
@@ -707,14 +764,7 @@ class AddParticipants(Gramplet):
         text = entry.get_text().strip()
         if not text:
             return
-        tokens = _fold(text).split()
-        if not tokens:
-            return
-        matches = [
-            (row[COMP_LABEL], row[COMP_HANDLE])
-            for row in self.completion_model
-            if all(token in row[COMP_SEARCH] for token in tokens)
-        ]
+        matches = self._ranked_matches(text)
         exact = [row for row in matches if _fold(row[0]) == _fold(text)]
         if exact:
             matches = exact
