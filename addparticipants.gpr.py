@@ -12,7 +12,10 @@ register(
         "Attach the selected event to multiple people at once, "
         "with type-ahead search and chronological insertion."
     ),
-    status=STABLE,
+    # BETA, not UNSTABLE: PluginRegister drops UNSTABLE plugins
+    # outright when stable_only is set (_pluginreg.py:1481), which
+    # would hide the addon rather than just labelling it.
+    status=BETA,
     fname="addparticipants.py",
     height=300,
     detached_width=600,

@@ -21,6 +21,10 @@ that prompted this project.
 - `addparticipants.gpr.py` — plugin registration. `navtypes=["Event"]`,
   `gramps_target_version="6.0"`.
 - `addparticipants.py` — the `AddParticipants(Gramplet)` class, all of it.
+- `test_addparticipants.py` — logic tests. Gramps embeds libpython and ships
+  no interpreter, so these stub out Gramps and GTK and cover the plain logic
+  only. `python3 test_addparticipants.py`, no framework needed. They do not
+  touch the GTK wiring.
 
 ## Environment
 
@@ -53,20 +57,39 @@ The `reload_plugins` addon from https://github.com/kkujansuu/gramps can refresh
 plugin code without a full restart — worth installing if the restart loop gets
 tedious.
 
-## Status: UNTESTED
+## Status: NOT YET RUN IN GRAMPS
 
-This code was written against the Gramps API docs but has never been run.
-Syntax checks clean; nothing else is verified. Suspect areas, in order:
+The GTK wiring has still never been exercised — nothing here has been loaded
+into a running Gramps. What *has* been done: every Gramps API call was checked
+against the 6.0 sources in
+`/Applications/Gramps.app/Contents/Resources/lib/python3.13/site-packages/gramps`,
+and `test_addparticipants.py` covers the non-GTK logic.
 
-1. **`self.gui.textview` removal in `init()`** — the conventional gramplet
-   pattern, but it has shifted between Gramps versions. If the panel renders
-   blank, start here.
-2. **`EventRoleType().get_standard_names()`** — wrapped in try/except with a
-   hardcoded fallback list, so a mismatch degrades rather than crashes.
-3. **`db.get_event_roles()`** — same, also guarded.
-4. **`find_backlink_handles`** — used to load existing participants. Guarded.
-5. **`Gramplet.connect_signal("Event", ...)`** — how the panel tracks the
-   selected event. If it never updates when changing rows, this is why.
+The original suspect list is resolved — all five were **correct as written**:
+
+1. `self.gui.textview` removal in `init()` — matches stock
+   `plugins/gramplet/events.py:65-69` exactly.
+2. `EventRoleType().get_standard_names()` — exists, `gen/lib/grampstype.py:291`.
+3. `db.get_event_roles()` — exists, `gen/db/generic.py:2463`, returns the
+   custom role names.
+4. `find_backlink_handles` — signature matches; deduplicated upstream via
+   `set()` at `plugins/db/dbapi/dbapi.py:750`, so no repeated rows.
+5. `connect_signal("Event", ...)` — `gen/plug/_gramplet.py:90`, connects to
+   the history's `active-changed`.
+
+Two further things worth not re-deriving:
+
+- `main()` as a plain function (not a generator) is fine: `_updater`
+  type-checks at `_gramplet.py:327` and 21 stock gramplets do the same.
+- A nested `Gtk.ScrolledWindow` inside `get_container_widget()` is fine — stock
+  `todogramplet.py:82-91` does it, and `grampletpane.py:964` puts a concrete
+  `set_size_request(-1, height)` on the outer scroller.
+
+**The real trap was elsewhere:** `db.get_*_from_handle()` **raises
+`HandleError`** for a dangling handle rather than returning `None`
+(`gen/db/generic.py:1449`). Every `if obj is None` guard was dead code. All
+lookups now go through `_get_person` / `_get_family` / `_get_event`. Use those
+rather than calling the db directly.
 
 ## Design decisions already made
 
