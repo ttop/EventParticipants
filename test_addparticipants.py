@@ -51,9 +51,30 @@ _mod("gramps"); _mod("gramps.gen")
 _mod("gramps.gen.plug", Gramplet=type("Gramplet",(),{}))
 _mod("gramps.gen.lib", EventRef=EventRef, EventRoleType=EventRoleType)
 _mod("gramps.gen.db", DbTxn=DbTxn)
+class Name:
+    """Stands in for gramps.gen.lib.Name."""
+    def __init__(self, given="", surname="", ntype=None, call="", nick="",
+                 raw=None):
+        self.given=given; self.surname=surname; self.ntype=ntype
+        self.call=call; self.nick=nick; self.raw=raw
+    def get_first_name(self): return self.given
+    def get_surname(self): return self.surname
+    def get_call_name(self): return self.call
+    def get_nick_name(self): return self.nick
+    def get_type(self): return self.ntype
+    def display(self):
+        if self.raw is not None: return self.raw
+        # LNFN, the Gramps default: "Surname, Given"
+        return ("%s, %s" % (self.surname, self.given)).strip().strip(",").strip()
+
+class _Displayer:
+    @staticmethod
+    def display(person): return person.get_primary_name().display()
+    @staticmethod
+    def display_name(name): return name.display() if name else ""
+
 _mod("gramps.gen.display")
-_mod("gramps.gen.display.name",
-     displayer=type("D",(),{"display":staticmethod(lambda p:p.name)})())
+_mod("gramps.gen.display.name", displayer=_Displayer())
 _mod("gramps.gen.datehandler", get_date=lambda e:"1900")
 _mod("gramps.gen.errors", HandleError=HandleError)
 _mod("gramps.gen.const", GRAMPS_LOCALE=type("L",(),{"translation":
@@ -73,8 +94,13 @@ class Ev:
     def __init__(self,s): self._s=s
     def get_date_object(self): return _Date(self._s)
 class Person:
-    def __init__(self,name,b=None,d=None,refs=None):
+    def __init__(self,name,b=None,d=None,refs=None,names=None):
         self.name=name; self._b=b; self._d=d; self.refs=refs or []
+        self._names=names
+    def get_primary_name(self):
+        return self._names[0] if self._names else Name(raw=self.name)
+    def get_alternate_names(self):
+        return self._names[1:] if self._names else []
     def get_birth_ref(self): return Ref(self._b) if self._b else None
     def get_death_ref(self): return Ref(self._d) if self._d else None
     def get_event_ref_list(self): return self.refs
@@ -161,23 +187,23 @@ print("\n[D] incremental people cache")
 g,db=make()
 db.people["p1"]=Person("Zoe"); db.people["p2"]=Person("Amy")
 g.build_people_cache()
-check("built and sorted by label %r"%[l for l,_ in g.people_cache],
-      [l for l,_ in g.people_cache]==["Amy","Zoe"])
+check("built and sorted by label %r"%[r[0] for r in g.people_cache],
+      [r[0] for r in g.people_cache]==["Amy","Zoe"])
 reads=[]
 _orig=db.get_person_from_handle
 db.get_person_from_handle=lambda h:(reads.append(h), _orig(h))[1]
 db.people["p1"].name="Zara"
 g.on_people_changed(["p1"])
 check("only the changed handle was re-read, got %r"%reads, reads==["p1"])
-check("cache reflects new label %r"%[l for l,_ in g.people_cache],
-      [l for l,_ in g.people_cache]==["Amy","Zara"])
+check("cache reflects new label %r"%[r[0] for r in g.people_cache],
+      [r[0] for r in g.people_cache]==["Amy","Zara"])
 g.on_people_deleted(["p2"])
-check("delete drops it without a re-read %r"%[l for l,_ in g.people_cache],
-      [l for l,_ in g.people_cache]==["Zara"])
+check("delete drops it without a re-read %r"%[r[0] for r in g.people_cache],
+      [r[0] for r in g.people_cache]==["Zara"])
 
 print("\n[E] refresh_completion skips redundant rebuilds")
 g,db=make()
-g.people_cache=[("Amy","p1"),("Bob","p2")]
+g.people_cache=[("Amy","p1","amy"),("Bob","p2","bob")]
 g.refresh_completion()
 first=len(g.completion_model)
 calls=[]
@@ -191,7 +217,8 @@ check("force=True rebuilds (%d appends)"%len(calls), len(calls)==2)
 
 print("\n[F] Enter in the search box")
 g,db=make()
-g.people_cache=[("Amy Smith","p1"),("Bob Smith","p2")]
+g.people_cache=[("Amy Smith","p1","amy smith"),
+                ("Bob Smith","p2","bob smith")]
 g.refresh_completion()
 g.stage_person=lambda l,h: g.__setattr__("staged",(l,h))
 g.staged=None
@@ -236,6 +263,52 @@ except HandleError:
     idx, ok = "RAISED", False
 check("inserts before e_late at index 2, got %r" % idx, ok)
 
+
+print("\n[J] matching: word order and married names")
+
+MARRIED = 3
+
+def matcher(g, typed):
+    """Everything the completion would offer for `typed`."""
+    g.refresh_completion(force=True)
+    comp = type("C",(),{"get_model":lambda s: g.completion_model})()
+    out=[]
+    for i in range(len(g.completion_model)):
+        if ap.AddParticipants._match_func(comp, typed.casefold(), i, None):
+            out.append(g.completion_model[i][0])
+    return out
+
+g,db=make()
+db.people["p1"]=Person("x", names=[Name("John Mervyn","Joy")])
+db.people["p2"]=Person("x", names=[
+    Name("Jane","Doe"),
+    Name("Jane","Smith",ntype=MARRIED),
+])
+db.people["p3"]=Person("x", names=[Name("Hans","M\u00fcller")])
+g.build_people_cache()
+
+check("'John Joy' finds 'Joy, John Mervyn' (order-independent)",
+      any("Joy" in m for m in matcher(g,"John Joy")))
+check("'joy john' finds it too",
+      any("Joy" in m for m in matcher(g,"joy john")))
+check("'Joy' alone still finds it",
+      any("Joy" in m for m in matcher(g,"Joy")))
+check("married name 'Smith' finds Jane Doe",
+      any("Doe" in m for m in matcher(g,"Smith")))
+check("'Jane Smith' finds her",
+      any("Doe" in m for m in matcher(g,"Jane Smith")))
+check("maiden name 'Jane Doe' still finds her",
+      any("Doe" in m for m in matcher(g,"Jane Doe")))
+check("'Muller' finds 'M\u00fcller' (accent-insensitive)",
+      any("ller" in m for m in matcher(g,"Muller")))
+check("unrelated text matches nothing",
+      matcher(g,"Xavier Nobody")==[])
+
+print("\n[K] the label shows an alternate surname")
+lbl = g._person_label(db.people["p2"])
+check("label mentions the married surname: %r" % lbl, "Smith" in lbl)
+check("...and still leads with the primary name: %r" % lbl,
+      lbl.startswith("Doe,"))
 
 print("\n" + ("ALL PASSED" if not fails else "FAILURES: %s" % fails))
 sys.exit(1 if fails else 0)
