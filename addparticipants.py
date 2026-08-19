@@ -10,6 +10,8 @@
 #
 
 import logging
+import re
+import unicodedata
 from xml.sax.saxutils import escape as xml_escape
 
 from gi.repository import Gtk, Pango
@@ -37,6 +39,11 @@ COL_REFIDX = 6     # index into the object's event_ref_list, -1 for new
 COL_WEIGHT = 7     # bold for staged additions
 COL_STATE_TEXT = 8  # translated text for the state column
 
+# Columns in the type-ahead model
+COMP_LABEL = 0
+COMP_HANDLE = 1
+COMP_SEARCH = 2    # folded text the matcher searches, never displayed
+
 STATE_EXISTING = ""
 STATE_NEW = "new"
 STATE_DETACH = "detach"
@@ -48,6 +55,18 @@ STATE_TEXT = {
     STATE_NEW: _("new"),
     STATE_DETACH: _("detach"),
 }
+
+
+def _fold(text):
+    """Reduce text to lowercase, unaccented, space-separated words.
+
+    Both the typed key and the searchable text go through this, so "Muller"
+    finds "Müller" and punctuation in the display format stops mattering.
+    GTK casefolds the key it hands us but leaves accents in place.
+    """
+    decomposed = unicodedata.normalize("NFKD", text or "")
+    bare = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+    return " ".join(part for part in re.split(r"[^\w]+", bare.casefold()) if part)
 
 
 class AddParticipants(Gramplet):
@@ -82,7 +101,7 @@ class AddParticipants(Gramplet):
         vbox.pack_start(self.header, False, False, 0)
 
         # --- Search entry with type-ahead ---
-        self.completion_model = Gtk.ListStore(str, str)  # label, handle
+        self.completion_model = Gtk.ListStore(str, str, str)
         completion = Gtk.EntryCompletion()
         completion.set_model(self.completion_model)
         completion.set_text_column(0)
@@ -204,7 +223,7 @@ class AddParticipants(Gramplet):
             if not removed:
                 person = self._get_person(handle)
                 if person is not None:
-                    self.people_labels[handle] = self._person_label(person)
+                    self.people_labels[handle] = self._person_entry(person)
         self._sort_people_cache()
 
     # Gramps raises HandleError for a dangling handle rather than returning
@@ -235,7 +254,7 @@ class AddParticipants(Gramplet):
         self.people_labels = {}
         if db is not None and db.is_open():
             for person in db.iter_people():
-                self.people_labels[person.get_handle()] = self._person_label(
+                self.people_labels[person.get_handle()] = self._person_entry(
                     person
                 )
         self._sort_people_cache()
@@ -243,15 +262,23 @@ class AddParticipants(Gramplet):
     def _sort_people_cache(self):
         """Derive the sorted (label, handle) list the completion reads."""
         self.people_cache = sorted(
-            ((label, handle) for handle, label in self.people_labels.items()),
+            ((label, handle, search)
+             for handle, (label, search) in self.people_labels.items()),
             key=lambda row: row[0],
         )
         # The completion is built from this list, so it has to be rebuilt.
         self.refresh_completion(force=True)
 
     def _person_label(self, person):
-        """Name plus birth/death years for disambiguation."""
+        """Primary name, any other surnames, then birth/death years."""
         name = name_displayer.display(person)
+        primary = person.get_primary_name()
+        primary_surname = primary.get_surname() if primary else ""
+        others = []
+        for alt in person.get_alternate_names():
+            surname = alt.get_surname()
+            if surname and surname != primary_surname and surname not in others:
+                others.append(surname)
         years = []
         for ref, marker in (
             (person.get_birth_ref(), "b."),
@@ -266,9 +293,33 @@ class AddParticipants(Gramplet):
                         year = str(date.get_year())
             if year:
                 years.append("%s %s" % (marker, year))
+        label = name
+        if others:
+            label += " [%s]" % ", ".join(others)
         if years:
-            return "%s (%s)" % (name, " ".join(years))
-        return name
+            label += " (%s)" % " ".join(years)
+        return label
+
+    def _person_search_text(self, person, label):
+        """Every form of the name, folded, for the type-ahead to search.
+
+        A married name is an *alternate* name, so searching only the primary
+        name never finds it. This walks [primary] + alternates, the same
+        idiom the rest of Gramps uses.
+        """
+        parts = [label]
+        for name in [person.get_primary_name()] + person.get_alternate_names():
+            parts.append(name_displayer.display_name(name))
+            parts.append(name.get_first_name())
+            parts.append(name.get_surname())
+            parts.append(name.get_call_name())
+            parts.append(name.get_nick_name())
+        return _fold(" ".join(part for part in parts if part))
+
+    def _person_entry(self, person):
+        """(display label, folded search text) for one person."""
+        label = self._person_label(person)
+        return label, self._person_search_text(person, label)
 
     def _family_label(self, family):
         names = []
@@ -387,15 +438,23 @@ class AddParticipants(Gramplet):
             return
         self._completion_excluded = listed
         self.completion_model.clear()
-        for label, handle in self.people_cache:
+        for label, handle, search in self.people_cache:
             if handle in listed:
                 continue
-            self.completion_model.append([label, handle])
+            self.completion_model.append([label, handle, search])
 
     @staticmethod
     def _match_func(completion, key, treeiter, _data):
-        model = completion.get_model()
-        return key in model[treeiter][0].casefold()
+        """Match when every typed word appears somewhere in the name.
+
+        The display format is "Surname, Given", so a plain substring test
+        never matched a name typed the way people say it.
+        """
+        tokens = _fold(key).split()
+        if not tokens:
+            return False
+        haystack = completion.get_model()[treeiter][COMP_SEARCH]
+        return all(token in haystack for token in tokens)
 
     # ------------------------------------------------------------------
     # Editing
@@ -413,13 +472,15 @@ class AddParticipants(Gramplet):
         text = entry.get_text().strip()
         if not text:
             return
-        key = text.casefold()
+        tokens = _fold(text).split()
+        if not tokens:
+            return
         matches = [
-            (row[0], row[1])
+            (row[COMP_LABEL], row[COMP_HANDLE])
             for row in self.completion_model
-            if key in row[0].casefold()
+            if all(token in row[COMP_SEARCH] for token in tokens)
         ]
-        exact = [row for row in matches if row[0].casefold() == key]
+        exact = [row for row in matches if _fold(row[0]) == _fold(text)]
         if exact:
             matches = exact
         if len(matches) == 1:

@@ -105,6 +105,15 @@ rather than calling the db directly.
 - Undated events (`get_sort_value()` of 0) are appended rather than sorted, so
   deliberate manual ordering isn't disturbed. Manual event ordering is a feature
   the user actively likes — do not add anything that bulk-reorders event lists.
+- Type-ahead matches **every word, in any order, against every form of the
+  name**. The display format is `LNFN` ("Surname, Given"), so a plain substring
+  test failed on the way people actually type — "John Joy" never found
+  "Joy, John Mervyn". Married names are *alternate* names
+  (`NameType.MARRIED`), so the searchable text walks
+  `[get_primary_name()] + get_alternate_names()` and also folds accents;
+  `name_displayer.display()` alone only ever sees the primary name.
+  Display and search are separate: `COMP_LABEL` is shown, `COMP_SEARCH` is
+  matched, and other surnames appear in the label as `Doe, Jane [Smith]`.
 
 ## Ideas not yet built
 
