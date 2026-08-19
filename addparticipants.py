@@ -382,12 +382,17 @@ class AddParticipants(Gramplet):
         return years
 
     def _build_spouse_map(self, db, surname_by_handle):
-        """Person handle -> surnames of their spouses.
+        """Person handle -> surnames they married into.
 
         Most trees never record a married name: it is implied by the marriage
-        and lives only in the family record. Searching for someone under the
-        surname they married into therefore has to come from here rather than
-        from their alternate names.
+        and lives only in the family record, so searching for someone under
+        the surname they married into has to come from here rather than from
+        their alternate names.
+
+        This runs one way only, from the father's surname to the mother. The
+        surname is not exchanged - a husband is not findable under his wife's
+        maiden name - and matching both directions turned a search for
+        "John Joy" into every John married to a Joy.
         """
         if surname_by_handle is None:
             surname_by_handle = {
@@ -402,10 +407,9 @@ class AddParticipants(Gramplet):
                 mother = data["mother_handle"]
                 if not father or not mother:
                     continue
-                for person, partner in ((father, mother), (mother, father)):
-                    surname = surname_by_handle.get(partner)
-                    if surname and surname != surname_by_handle.get(person):
-                        spouses.setdefault(person, set()).add(surname)
+                surname = surname_by_handle.get(father)
+                if surname and surname != surname_by_handle.get(mother):
+                    spouses.setdefault(mother, set()).add(surname)
         return {handle: sorted(names) for handle, names in spouses.items()}
 
     def _other_surnames(self, handle, primary_surname, alternates):
@@ -420,7 +424,7 @@ class AddParticipants(Gramplet):
             if surname and surname != primary_surname and surname not in others:
                 others.append(surname)
         for surname in self._index_spouses.get(handle, ()):
-            marked = _("m. %s") % surname
+            marked = _("m. %s") % surname  # married into, not her own
             if surname != primary_surname and surname not in others:
                 if marked not in others:
                     others.append(marked)

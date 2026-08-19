@@ -574,8 +574,12 @@ check("her label says who she married: %r" % g.people_labels["lou"][0],
       "Reyman" in g.people_labels["lou"][0])
 check("and it reads as a marriage, not as her own surname",
       "m. Reyman" in g.people_labels["lou"][0])
-check("'Ernest Heitt' finds him too (symmetric, and true)",
-      any("Reyman" in m for m in hits("Ernest Heitt")))
+check("'Ernest Heitt' does NOT find him - the surname travels one way",
+      not any("Reyman" in m for m in hits("Ernest Heitt")))
+check("his own label carries no married surname: %r"
+      % g.people_labels["ern"][0], "m. " not in g.people_labels["ern"][0])
+check("'Ernest Reyman' still finds him by his own name",
+      any("Reyman" in m for m in hits("Ernest Reyman")))
 check("unrelated names still match nobody", hits("Zebedee Nobody")==[])
 
 print("\n[V] spouse surnames survive the object fallback")

@@ -147,12 +147,14 @@ rather than calling the db directly.
 - **A married surname is almost never stored on the person.** Gramps has
   `NameType.MARRIED` for it, but in this tree exactly 1 person of 2,421 uses
   one — the surname a woman married into lives only in the family record. So
-  the index also walks `get_family_cursor()` and gives each spouse the other's
-  surname, which is what makes "Louisa Reyman" find `Heitt, Louisa`. It applies
-  in both directions and shows in the label as `[m. Reyman]`, which reads
-  correctly either way: a husband is not known by his wife's surname, but he
-  is married to it. This deliberately widens matching — "John Joy" now also
-  finds a John married to a Joy — and the label says why each row matched.
+  the index also walks `get_family_cursor()` and gives the **mother** the
+  **father's** surname, which is what makes "Louisa Reyman" find
+  `Heitt, Louisa [m. Reyman]`.
+  **One direction only.** Wives are known by their husbands' surnames, not the
+  reverse, so the surname is never exchanged — a husband must not become
+  findable under his wife's maiden name. Doing it symmetrically turned a
+  search for "John Joy" into every John married to a Joy. Direction comes from
+  the family's `father_handle`/`mother_handle`, so no gender lookup is needed.
 - When a search behaviour looks wrong, **check what the tree actually stores**
   before changing code. The trees are at the paths listed in
   `~/Library/Application Support/gramps/recent-files-gramps.xml`, and the
