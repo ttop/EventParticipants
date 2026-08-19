@@ -144,6 +144,15 @@ rather than calling the db directly.
   `name_displayer.display()` alone only ever sees the primary name.
   Display and search are separate: `COMP_LABEL` is shown, `COMP_SEARCH` is
   matched, and other surnames appear in the label as `Doe, Jane [Smith]`.
+- **Type-ahead results are ranked, so the model is rebuilt per keystroke.**
+  `GtkEntryCompletion` filters but never reorders — it shows model rows in
+  model order — so an alphabetical model put `Johnson, Bonnie [m. Joy]` above
+  `Joy, John Mervyn` for "John Joy". `_ranked_matches()` scores each typed word
+  against the words of the indexed text (whole word > start of a word > inside
+  a word, and earlier positions count for more, since a person's own name
+  comes before their alternate and married surnames), and
+  `_update_completion()` refills the model best-first, capped at
+  `COMPLETION_LIMIT`. Sub-millisecond on 2,400 people.
 - **A married surname is almost never stored on the person.** Gramps has
   `NameType.MARRIED` for it, but in this tree exactly 1 person of 2,421 uses
   one — the surname a woman married into lives only in the family record. So
@@ -165,8 +174,10 @@ rather than calling the db directly.
   before changing code. The trees are at the paths listed in
   `~/Library/Application Support/gramps/recent-files-gramps.xml`, and the
   `sqlite.db` there can be read with plain `sqlite3` + `json` — the person,
-  family and event rows carry a `json_data` column. Opening it
-  `file:...?mode=ro&immutable=1` is safe while Gramps is running. Two rounds
+  family and event rows carry a `json_data` column. Open it `file:...?mode=ro`
+  and **not** `immutable=1`: that flag tells SQLite the file cannot change, and
+  reading with it while Gramps has the tree open returned a stale death year
+  in one run and the correct one in the next. Two rounds
   of fixing the wrong thing here would have been avoided by looking first.
 
 ## Ideas not yet built

@@ -220,9 +220,12 @@ def make():
     g._commit_object=lambda kind,obj,trans: g.commits.append((kind,obj))
     g.status=type("L",(),{"set_text":lambda s,t:setattr(g,"last_status",t)})()
     g.apply_btn=type("B",(),{"set_sensitive":lambda s,v:None})()
-    g.entry=type("E",(),{"set_placeholder_text":
-        lambda s,t: setattr(g,"placeholder",t)})()
+    g.entry=type("E",(),{
+        "set_placeholder_text": lambda s,t: setattr(g,"placeholder",t),
+        "get_text": lambda s: getattr(g,"typed",""),
+        "set_text": lambda s,t: setattr(g,"typed",t)})()
     g._index_id=0; g._index_iter=None; g._index_spouses={}
+    g._completion_excluded=frozenset(); g._matches=[]; g.typed=""
     g.event=None; g.last_status=None; g.placeholder=None
     return g,db
 
@@ -292,19 +295,31 @@ g.on_people_deleted(["p2"])
 check("delete drops it without a re-read %r"%[r[0] for r in g.people_cache],
       [r[0] for r in g.people_cache]==["Zara"])
 
-print("\n[E] refresh_completion skips redundant rebuilds")
+print("\n[E] refresh_completion skips redundant work")
 g,db=make()
 g.people_cache=[("Amy","p1","amy"),("Bob","p2","bob")]
-g.refresh_completion()
-first=len(g.completion_model)
 calls=[]
-_ap=g.completion_model.append
-g.completion_model.append=lambda r:(calls.append(r), _ap(r))[1]
+g._update_completion=lambda *a: calls.append(1)
 g.refresh_completion()
-check("built %d rows first time"%first, first==2)
-check("second identical call did no work (%d appends)"%len(calls), len(calls)==0)
+check("nothing to do while the excluded set is unchanged (%d)"%len(calls),
+      len(calls)==0)
+g.model.append(row("Amy","Primary",ap.STATE_EXISTING,"p1","Person","Primary",0))
+g.refresh_completion()
+check("someone becoming a participant refreshes it (%d)"%len(calls),
+      len(calls)==1)
+g.refresh_completion()
+check("but only once (%d)"%len(calls), len(calls)==1)
 g.refresh_completion(force=True)
-check("force=True rebuilds (%d appends)"%len(calls), len(calls)==2)
+check("force=True refreshes anyway (%d)"%len(calls), len(calls)==2)
+
+g,db=make()
+g.people_cache=[("Amy","p1","amy"),("Bob","p2","bob")]
+g.typed="am"; g._update_completion()
+check("the model holds only what was typed for (%d row)"
+      % len(g.completion_model), len(g.completion_model)==1)
+check("...and it is the right one", g.completion_model[0][0]=="Amy")
+g.typed=""; g._update_completion()
+check("an empty box offers nothing", len(g.completion_model)==0)
 
 print("\n[F] Enter in the search box")
 g,db=make()
@@ -360,14 +375,8 @@ print("\n[J] matching: word order and married names")
 MARRIED = 3
 
 def matcher(g, typed):
-    """Everything the completion would offer for `typed`."""
-    g.refresh_completion(force=True)
-    comp = type("C",(),{"get_model":lambda s: g.completion_model})()
-    out=[]
-    for i in range(len(g.completion_model)):
-        if ap.AddParticipants._match_func(comp, typed.casefold(), i, None):
-            out.append(g.completion_model[i][0])
-    return out
+    """Everything the completion would offer for `typed`, best first."""
+    return [label for label, _h, _s in g._ranked_matches(typed)]
 
 g,db=make()
 db.people["p1"]=Person("x", names=[Name("John Mervyn","Joy")])
@@ -558,11 +567,7 @@ db.raw_families=[{"handle":"f1","father_handle":"ern","mother_handle":"lou"}]
 g.build_people_cache(); drain(g)
 
 def hits(typed):
-    g.refresh_completion(force=True)
-    comp=type("C",(),{"get_model":lambda s: g.completion_model})()
-    return [g.completion_model[i][0]
-            for i in range(len(g.completion_model))
-            if ap.AddParticipants._match_func(comp, typed.casefold(), i, None)]
+    return [label for label, _h, _s in g._ranked_matches(typed)]
 
 check("no married name is stored on her",
       db.people["lou"].get_alternate_names()==[])
@@ -593,6 +598,38 @@ g.build_people_cache(); drain(g)
 check("fell back to the object API", g._index_raw is False)
 check("still learned the spouse surname",
       "Reyman" in g.people_labels["lou"][0])
+
+print("\n[W] the best matches come first")
+g,db=make()
+db.people["a"]=Person("x", names=[Name("John Mervyn","Joy")])
+db.people["b"]=Person("x", names=[Name("Bonnie E.","Johnson")])
+db.people["c"]=Person("x", names=[Name("Daniel John","Joy")])
+# Bonnie married a Joy, so she matches "Joy" through her married surname
+db.raw_families=[{"handle":"f1","father_handle":"a","mother_handle":"b"}]
+g.build_people_cache(); drain(g)
+
+order=[l for l,_h,_s in g._ranked_matches("John Joy")]
+check("all three still match: %r" % order, len(order)==3)
+check("a real 'John Joy' is first: %r" % order[0], order[0].startswith("Joy,"))
+check("both Joys outrank the Johnson",
+      all(x.startswith("Joy,") for x in order[:2]))
+check("the married-surname match sinks to last: %r" % order[-1],
+      "Johnson" in order[-1])
+
+# a whole word beats the start of a longer one
+order=[l for l,_h,_s in g._ranked_matches("John")]
+check("exact word 'John' outranks the 'Johnson' prefix: %r" % order[0],
+      "Johnson" not in order[0])
+
+print("\n[X] the popup is capped")
+g,db=make()
+for i in range(120):
+    db.people["p%d"%i]=Person("x", names=[Name("Test%d"%i,"Common")])
+g.build_people_cache(); drain(g)
+g.typed="common"; g._update_completion()
+check("all 120 are matches", len(g._matches)==120)
+check("but only %d are offered" % ap.COMPLETION_LIMIT,
+      len(g.completion_model)==ap.COMPLETION_LIMIT)
 
 print("\n" + ("ALL PASSED" if not fails else "FAILURES: %s" % fails))
 sys.exit(1 if fails else 0)
