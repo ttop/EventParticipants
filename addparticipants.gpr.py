@@ -12,7 +12,7 @@ register(
         "Attach the selected event to multiple people at once, "
         "with type-ahead search and chronological insertion."
     ),
-    status=STABLE,
+    status=UNSTABLE,
     fname="addparticipants.py",
     height=300,
     detached_width=600,
