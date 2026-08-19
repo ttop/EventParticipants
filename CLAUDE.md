@@ -160,18 +160,22 @@ rather than calling the db directly.
   comes before their alternate and married surnames), and
   `_update_completion()` refills the model best-first, capped at
   `COMPLETION_LIMIT`. Sub-millisecond on 2,400 people.
-- **Someone who was not alive when the event happened is demoted, never
-  hidden.** `_alive_at()` answers True / False / **None**, and None — neither
-  date recorded, which is common — must never count against anyone. False
-  costs `LIFESPAN_PENALTY`, which drops them below every plausible match; with
-  `COMPLETION_LIMIT` they then fall off the popup, so it narrows in practice
-  while staying recoverable. Hiding them outright was rejected on purpose:
-  a wrong death year would make someone silently unfindable, and this project
-  has already been bitten twice by failures that present as "search is
-  broken". `DEATH_GRACE` allows burial and probate to follow a death, and
-  `MAX_LIFESPAN` covers the common case of a birth with no death recorded.
-  An undated event penalises nobody. On the real tree a 1950 event demotes 74
-  of the 120 people matching "Wells".
+- **Someone who cannot have been alive at the event is left out of the
+  offer.** `_alive_at()` answers True / False / **None**, and only a wholly
+  undated person is None — one date is enough to infer the other to within
+  `MAX_LIFESPAN` (100 years), which is what makes this worth anything, since
+  723 people here have a birth and no death. `DEATH_GRACE` lets burial and
+  probate follow a death; an undated event excludes nobody.
+  This is deliberately aggressive rather than defensive. An earlier version
+  only demoted, to protect against a wrong death year; that was overruled on
+  the grounds that this is a *convenience* gramplet and the stock way of
+  attaching a person to an event is always available when the shortlist is
+  wrong. Do not quietly reintroduce hedging here.
+  When a search returns nothing but people were excluded, Enter says so —
+  otherwise a filtered-out person reads as a broken search.
+  Real numbers: a 1950 event cuts "Wells" from 119 offers to 45, and a 1720
+  event to 13. 1,057 of 2,421 people carry neither date and are never
+  excluded, which caps how much this can ever narrow.
 - **A married surname is almost never stored on the person.** Gramps has
   `NameType.MARRIED` for it, but in this tree exactly 1 person of 2,421 uses
   one — the surname a woman married into lives only in the family record. So

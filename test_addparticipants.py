@@ -226,7 +226,7 @@ def make():
         "set_text": lambda s,t: setattr(g,"typed",t)})()
     g._index_id=0; g._index_iter=None; g._index_spouses={}
     g._completion_excluded=frozenset(); g._matches=[]; g.typed=""
-    g._index_lifespan={}
+    g._index_lifespan={}; g._not_living=0
     g.event=None; g.last_status=None; g.placeholder=None
     return g,db
 
@@ -632,7 +632,7 @@ check("all 120 are matches", len(g._matches)==120)
 check("but only %d are offered" % ap.COMPLETION_LIMIT,
       len(g.completion_model)==ap.COMPLETION_LIMIT)
 
-print("\n[Y] people who were not alive then sink to the bottom")
+print("\n[Y] people who were not alive then are left out")
 
 def tree_with_event(event_year):
     g,db=make()
@@ -651,10 +651,11 @@ def tree_with_event(event_year):
 
 g = tree_with_event(1950)
 order=[h for _l,h,_s in g._ranked_matches("Sarah Fisher")]
-check("everyone still reachable: %r" % (order,), len(order)==3)
-check("the one who died in 1900 is last: %r" % order[-1], order[-1]=="dead")
-check("someone with no dates is not penalised",
-      order.index("nodates") < order.index("dead"))
+check("the one who died in 1900 is gone: %r" % (order,), "dead" not in order)
+check("the living ones remain", set(order)=={"later","nodates"})
+check("and the gramplet counted what it dropped (%d)" % g._not_living,
+      g._not_living==1)
+check("someone with no dates at all is kept", "nodates" in order)
 check("_alive_at says so outright", g._alive_at("dead",1950) is False)
 check("...and stays silent when there are no dates",
       g._alive_at("nodates",1950) is None)
@@ -669,13 +670,43 @@ check("someone born in 1920 was not there in 1900",
       g._alive_at("later",1900) is False)
 check("and a 1920 birth with no death is fine in 1950",
       tree_with_event(1950)._alive_at("later",1950) is True)
-check("but not 150 years on", tree_with_event(2080)._alive_at("later",2080)
-      is False)
+check("a birth with no death is assumed ended after %d years"
+      % ap.MAX_LIFESPAN,
+      tree_with_event(2080)._alive_at("later",2080) is False)
+check("...and still alive just inside it",
+      tree_with_event(2019)._alive_at("later",2019) is True)
 
 g = tree_with_event(None)
 order=[h for _l,h,_s in g._ranked_matches("Sarah Fisher")]
-check("an undated event penalises nobody: %r" % (order,),
-      order.index("dead") < 3 and g._event_year()==0)
+check("an undated event excludes nobody: %r" % (order,),
+      len(order)==3 and g._event_year()==0)
+
+# a death with no birth is inferred backwards the same way
+g,db=make()
+db.events["d9"]=Ev(0,1900)
+db.people["oldster"]=Person("x", names=[Name("Mary","Stone")],
+                            d="d9", refs=[Ref("d9")])
+g.build_people_cache(); drain(g)
+g.event=Ev(0,1750); g.event.get_handle=lambda:"E"
+check("a death in 1900 with no birth rules out 1750",
+      g._alive_at("oldster",1750) is False)
+g.event=Ev(0,1850); g.event.get_handle=lambda:"E"
+check("...but not 1850", g._alive_at("oldster",1850) is True)
+
+# Enter says why nothing came back
+g,db=make()
+db.events["b1"]=Ev(0,1850); db.events["d1"]=Ev(0,1900)
+db.people["dead"]=Person("x", names=[Name("Sarah","Fisher")],
+                         b="b1", d="d1", refs=[Ref("b1"),Ref("d1")])
+g.build_people_cache(); drain(g)
+g.event=Ev(0,1990); g.event.get_handle=lambda:"E"
+g.stage_person=lambda l,h: g.__setattr__("staged",(l,h)); g.staged=None
+ent=type("E",(),{"get_text":lambda s:"Sarah Fisher",
+                 "set_text":lambda s,t:None})()
+g.on_entry_activate(ent)
+check("Enter stages nobody", g.staged is None)
+check("and explains the omission: %r" % g.last_status,
+      "not living" in str(g.last_status))
 
 print("\n[Z] staging uses the indexed label, not whatever was displayed")
 g,db=make()

@@ -53,12 +53,16 @@ INDEX_CHUNK = 250
 # rows in model order, so the model is rebuilt per keystroke, best first.
 COMPLETION_LIMIT = 40
 
-# Someone demonstrably not alive when the event happened is pushed below
-# everyone plausible rather than hidden. Genealogy dates are routinely wrong
-# or missing, and quietly making a person unreachable is a worse failure than
-# listing them last - the label already shows their dates either way.
-LIFESPAN_PENALTY = 10000
-MAX_LIFESPAN = 110   # years, used when only one of the two dates is known
+# Someone who cannot have been alive when the event happened is left out of
+# the offer entirely. This is a convenience gramplet: the stock way of
+# attaching a person to an event is always there when the shortlist is wrong,
+# so a tighter list is worth more than covering for a bad date.
+#
+# A missing date is inferred rather than treated as unknown: with only a
+# birth, assume death within MAX_LIFESPAN of it; with only a death, assume
+# birth within MAX_LIFESPAN before it. Neither date at all stays unknown, and
+# unknown is never held against anyone.
+MAX_LIFESPAN = 100   # years
 DEATH_GRACE = 2      # burials, probate and the like follow a death
 
 STATE_EXISTING = ""
@@ -119,6 +123,7 @@ class AddParticipants(Gramplet):
         self._index_years = {}      # event handle -> year, for labels
         self._index_spouses = {}    # person handle -> spouse surnames
         self._index_lifespan = {}   # person handle -> (birth year, death year)
+        self._not_living = 0        # left out of the last search by date
         self.gui.WIDGET = self.build_gui()
         container = self.gui.get_container_widget()
         if self.gui.textview in container.get_children():
@@ -735,10 +740,11 @@ class AddParticipants(Gramplet):
         return date.get_year() or 0
 
     def _alive_at(self, handle, year):
-        """True, False, or None when the recorded dates cannot say.
+        """True, False, or None when neither date is recorded.
 
-        None is the common answer - plenty of people have neither date - and
-        it must never count against them.
+        Only a wholly undated person is unknown. One date is enough to infer
+        the other to within MAX_LIFESPAN, which is what makes this worth
+        anything: most people here have a birth year and no death year.
         """
         birth, death = self._index_lifespan.get(handle, (0, 0))
         if not birth and not death:
@@ -766,12 +772,16 @@ class AddParticipants(Gramplet):
         if not tokens:
             return []
         event_year = self._event_year()
+        self._not_living = 0
         scored = []
         for label, handle, search in self.people_cache:
             if handle in self._completion_excluded:
                 continue
             # Cheap reject first; only survivors are worth scoring.
             if not all(token in search for token in tokens):
+                continue
+            if event_year and self._alive_at(handle, event_year) is False:
+                self._not_living += 1
                 continue
             words = search.split()
             score = 0
@@ -790,8 +800,6 @@ class AddParticipants(Gramplet):
                     if quality > best:
                         best = quality
                 score += best
-            if event_year and self._alive_at(handle, event_year) is False:
-                score -= LIFESPAN_PENALTY
             scored.append((-score, label, handle, search))
         scored.sort()
         return [(label, handle, search) for _s, label, handle, search in scored]
@@ -832,6 +840,11 @@ class AddParticipants(Gramplet):
         if len(matches) == 1:
             self.stage_person(matches[0][0], matches[0][1])
             entry.set_text("")
+        elif not matches and self._not_living:
+            self.status.set_text(
+                _("No match for '%(text)s' (%(count)d not living then)")
+                % {"text": text, "count": self._not_living}
+            )
         elif not matches:
             self.status.set_text(_("No match for '%s'") % text)
         else:
