@@ -226,6 +226,7 @@ def make():
         "set_text": lambda s,t: setattr(g,"typed",t)})()
     g._index_id=0; g._index_iter=None; g._index_spouses={}
     g._completion_excluded=frozenset(); g._matches=[]; g.typed=""
+    g._index_lifespan={}
     g.event=None; g.last_status=None; g.placeholder=None
     return g,db
 
@@ -630,6 +631,59 @@ g.typed="common"; g._update_completion()
 check("all 120 are matches", len(g._matches)==120)
 check("but only %d are offered" % ap.COMPLETION_LIMIT,
       len(g.completion_model)==ap.COMPLETION_LIMIT)
+
+print("\n[Y] people who were not alive then sink to the bottom")
+
+def tree_with_event(event_year):
+    g,db=make()
+    db.events["b1"]=Ev(0,1850); db.events["d1"]=Ev(0,1900)   # died 1900
+    db.events["b2"]=Ev(0,1920)                                # born 1920
+    db.people["dead"]=Person("x", names=[Name("Sarah","Fisher")],
+                             b="b1", d="d1", refs=[Ref("b1"),Ref("d1")])
+    db.people["later"]=Person("x", names=[Name("Sarah","Fisher")],
+                              b="b2", refs=[Ref("b2")])
+    db.people["nodates"]=Person("x", names=[Name("Sarah","Fisher")])
+    g.build_people_cache(); drain(g)
+    g.event = Ev(0, event_year) if event_year else None
+    if event_year:
+        g.event.get_handle=lambda:"E"
+    return g
+
+g = tree_with_event(1950)
+order=[h for _l,h,_s in g._ranked_matches("Sarah Fisher")]
+check("everyone still reachable: %r" % (order,), len(order)==3)
+check("the one who died in 1900 is last: %r" % order[-1], order[-1]=="dead")
+check("someone with no dates is not penalised",
+      order.index("nodates") < order.index("dead"))
+check("_alive_at says so outright", g._alive_at("dead",1950) is False)
+check("...and stays silent when there are no dates",
+      g._alive_at("nodates",1950) is None)
+
+g = tree_with_event(1900)
+check("a death in the event year is still plausible",
+      g._alive_at("dead",1900) is True)
+check("burial two years later is tolerated",
+      g._alive_at("dead",1902) is True)
+check("but not a decade later", g._alive_at("dead",1910) is False)
+check("someone born in 1920 was not there in 1900",
+      g._alive_at("later",1900) is False)
+check("and a 1920 birth with no death is fine in 1950",
+      tree_with_event(1950)._alive_at("later",1950) is True)
+check("but not 150 years on", tree_with_event(2080)._alive_at("later",2080)
+      is False)
+
+g = tree_with_event(None)
+order=[h for _l,h,_s in g._ranked_matches("Sarah Fisher")]
+check("an undated event penalises nobody: %r" % (order,),
+      order.index("dead") < 3 and g._event_year()==0)
+
+print("\n[Z] staging uses the indexed label, not whatever was displayed")
+g,db=make()
+db.people["p1"]=Person("x", names=[Name("Ann","Lee")])
+g.build_people_cache(); drain(g)
+g.stage_person("Ann Lee -- DECORATED", "p1")
+check("participant row shows the real label: %r" % g.model[0][ap.COL_NAME],
+      g.model[0][ap.COL_NAME]=="Lee, Ann")
 
 print("\n" + ("ALL PASSED" if not fails else "FAILURES: %s" % fails))
 sys.exit(1 if fails else 0)
