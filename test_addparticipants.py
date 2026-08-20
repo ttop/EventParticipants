@@ -102,6 +102,43 @@ class EventRef:
     def set_reference_handle(self,h): self.ref=h
     def set_role(self,r): self.role=r
     def get_role(self): return self.role
+class Date:
+    """Enough of gramps.gen.lib.Date to exercise the calendar conversion.
+
+    Hebrew years run about 3760 ahead of Gregorian ones. The exact offset
+    does not matter here, only that a year in another calendar must not be
+    taken at face value.
+    """
+    CAL_GREGORIAN=0; CAL_HEBREW=2
+    _POS_YR=2
+    _OFFSET={0:0, 2:3760}
+    def __init__(self, source=None):
+        if source is None:
+            self.calendar=0; self.dateval=(0,0,0,False); self.quality=0
+            self.modifier=0; self.text=""; self.newyear=0; self.sortval=0
+        else:
+            self.calendar=source.calendar; self.dateval=tuple(source.dateval)
+            self.quality=source.quality; self.modifier=source.modifier
+            self.text=source.text; self.newyear=source.newyear
+            self.sortval=source.sortval
+    def set(self, quality=None, modifier=None, calendar=None, value=None,
+            text=None, newyear=0):
+        if quality is not None: self.quality=quality
+        if modifier is not None: self.modifier=modifier
+        if calendar is not None: self.calendar=calendar
+        if value is not None: self.dateval=tuple(value)
+        if text is not None: self.text=text
+        self.newyear=newyear
+    def get_calendar(self): return self.calendar
+    def get_year(self): return self.dateval[self._POS_YR]
+    def get_sort_value(self): return self.sortval
+    def convert_calendar(self, calendar, known_valid=True):
+        year=self.dateval[self._POS_YR]
+        if year:
+            year=year - self._OFFSET[self.calendar] + self._OFFSET[calendar]
+        self.dateval=(self.dateval[0], self.dateval[1], year, False)
+        self.calendar=calendar
+
 class DbTxn:
     def __init__(self,msg,db): pass
     def __enter__(self): return self
@@ -109,7 +146,8 @@ class DbTxn:
 
 _mod("gramps"); _mod("gramps.gen")
 _mod("gramps.gen.plug", Gramplet=type("Gramplet",(),{}))
-_mod("gramps.gen.lib", EventRef=EventRef, EventRoleType=EventRoleType)
+_mod("gramps.gen.lib", Date=Date, EventRef=EventRef,
+     EventRoleType=EventRoleType)
 _mod("gramps.gen.db", DbTxn=DbTxn)
 def _format_surnames(parts):
     """SurnameBase.get_surname() over (surname, prefix, connector) triples.
@@ -171,13 +209,14 @@ import addparticipants as ap
 class Ref:
     def __init__(self,ref,role=None): self.ref=ref; self.role=role
     def set_role(self,r): self.role=r
-class _Date:
-    def __init__(self,s,year=0): self.s=s; self.year=year
-    def get_sort_value(self): return self.s
-    def get_year(self): return self.year
 class Ev:
-    def __init__(self,s,year=0): self._s=s; self._y=year
-    def get_date_object(self): return _Date(self._s,self._y)
+    def __init__(self,s,year=0,calendar=0):
+        self._s=s; self._y=year; self._c=calendar
+    def get_date_object(self):
+        date=Date()
+        date.set(calendar=self._c, value=(0,0,self._y,False))
+        date.sortval=self._s
+        return date
 class Family:
     def __init__(self,father=None,mother=None,handle=None):
         self._father=father; self._mother=mother; self.handle=handle
@@ -246,10 +285,15 @@ class FakeDb:
                          "mother_handle":f.get_mother_handle()}
                         for h,f in self.families.items()])
     def get_event_cursor(self):
-        return _Cursor([{"handle":h,
-                         "date":{"dateval":[0,0,
-                                 e.get_date_object().get_year(),False]}}
-                        for h,e in self.events.items()])
+        rows=[]
+        for h,e in self.events.items():
+            d=e.get_date_object()
+            rows.append({"handle":h,
+                         "date":{"dateval":list(d.dateval),
+                                 "calendar":d.calendar,"quality":d.quality,
+                                 "modifier":d.modifier,"text":d.text,
+                                 "newyear":d.newyear,"sortval":d.sortval}})
+        return _Cursor(rows)
     def emit(self, signal, args): self.emitted.append((signal, args))
     def get_person_handles(self, sort_handles=False): return list(self.people)
     def is_open(self): return True
@@ -584,12 +628,13 @@ print("\n[S] raw indexing and the object path agree exactly")
 # the stored dicts and from a built Person, or the search box behaves
 # differently depending on which path the index happened to take.
 
-def parity(title, names, spouse=None):
+def parity(title, names, spouse=None, calendar=0, years=(1901,1980)):
     """Index one person both ways; insist the two agree byte for byte."""
     entries=[]
     for force_object in (False, True):
         g,db=make()
-        db.events["E1"]=Ev(0,1901); db.events["E2"]=Ev(0,1980)
+        db.events["E1"]=Ev(0,years[0],calendar)
+        db.events["E2"]=Ev(0,years[1],calendar)
         db.people["p1"]=Person("x", names=names, b="E1", d="E2",
                                refs=[Ref("E1"),Ref("E2")])
         if spouse is not None:
@@ -633,6 +678,13 @@ lab = parity("married", [Name("Louisa","Heitt")],
              spouse=Name("Ernest","Reyman"))
 check("a surname reached by marriage is annotated the same way: %r" % lab,
       "m. Reyman" in lab)
+
+lab = parity("hebrew calendar", [Name("Chaim","Levi")],
+             calendar=Date.CAL_HEBREW, years=(5661,5740))
+check("both readers convert to the Gregorian year: %r" % lab,
+      "1901" in lab and "1980" in lab)
+check("...and neither shows the calendar-local one: %r" % lab,
+      "5661" not in lab and "5740" not in lab)
 
 print("\n[T] a broken raw layout degrades instead of emptying the index")
 g,db=make()
@@ -881,6 +933,28 @@ g.build_people_cache(); drain(g)
 lab=g.people_labels["w"][0]
 check("surname, alias and marriage all shown: %r" % lab,
       "Smith" in lab and "aka Janie" in lab and "m. Brown" in lab)
+
+print("\n[AD] a year in another calendar is converted before it is used")
+# One Hebrew-calendar event reads as year 5686. Compared as a Gregorian
+# year it postdates everybody, so _alive_at() would rule out the whole tree.
+g,db=make()
+db.events["b1"]=Ev(0,5686,Date.CAL_HEBREW)          # 1926 Gregorian
+db.people["p1"]=Person("x", names=[Name("Chaim","Levi")],
+                       b="b1", refs=[Ref("b1")])
+g.build_people_cache(); drain(g)
+check("the label carries the Gregorian year: %r" % g.people_labels["p1"][0],
+      "1926" in g.people_labels["p1"][0]
+      and "5686" not in g.people_labels["p1"][0])
+check("so does the lifespan the alive filter reads: %r"
+      % (g._index_lifespan["p1"],), g._index_lifespan["p1"][0]==1926)
+g.event=Ev(0,5686,Date.CAL_HEBREW); g.event.get_handle=lambda:"E"
+check("the event's own year is converted too (%d)" % g._event_year(),
+      g._event_year()==1926)
+check("...so a 1926 birth is not ruled out by a 1926 event",
+      g._alive_at("p1", g._event_year()) is True)
+check("and someone born in 1926 is still offered: %r"
+      % [h for _l,h,_s in g._ranked_matches("Chaim Levi")],
+      [h for _l,h,_s in g._ranked_matches("Chaim Levi")]==["p1"])
 
 print("\n[AB] a change that lands during the index build is not clobbered")
 # The raw build walks a snapshot of the table taken at build_people_cache time.

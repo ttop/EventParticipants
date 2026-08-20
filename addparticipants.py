@@ -32,7 +32,7 @@ from xml.sax.saxutils import escape as xml_escape
 from gi.repository import GLib, Gtk, Pango
 
 from gramps.gen.plug import Gramplet
-from gramps.gen.lib import EventRef, EventRoleType
+from gramps.gen.lib import Date, EventRef, EventRoleType
 from gramps.gen.db import DbTxn
 from gramps.gen.display.name import displayer as name_displayer
 from gramps.gen.datehandler import get_date
@@ -118,6 +118,58 @@ def _raw_surname(name_data):
         totalsurn = _("%(first)s %(second)s") % {"first": totalsurn,
                                                  "second": fsurn}
     return totalsurn.strip()
+
+
+def _gregorian_year(date):
+    """The year of a Date in the Gregorian calendar, or 0.
+
+    Date.get_year() answers in the date's *own* calendar, so one event
+    entered in the Hebrew calendar reads as year 5686: nonsense in a label,
+    and on its own enough for _alive_at() to rule out everybody in the tree.
+    gen/lib/date.py:2133 converts the same way.
+    """
+    if date is None:
+        return 0
+    try:
+        if date.get_calendar() != Date.CAL_GREGORIAN:
+            converted = Date(date)
+            converted.convert_calendar(Date.CAL_GREGORIAN)
+            return converted.get_year() or 0
+    except Exception:
+        LOG.debug("could not convert a date to the Gregorian calendar",
+                  exc_info=True)
+    return date.get_year() or 0
+
+
+def _raw_year(date_data):
+    """The Gregorian year of a stored date, or 0.
+
+    dateval carries the year in whatever calendar the date was entered in,
+    so a non-Gregorian one is rebuilt just far enough to convert it. Nearly
+    every date is Gregorian and constructs nothing.
+    """
+    if not date_data:
+        return 0
+    dateval = date_data["dateval"]
+    if not dateval or len(dateval) <= Date._POS_YR:
+        return 0
+    year = dateval[Date._POS_YR] or 0
+    calendar = date_data["calendar"]
+    if not year or not calendar:
+        return year
+    try:
+        date = Date()
+        date.set(quality=date_data["quality"],
+                 modifier=date_data["modifier"],
+                 calendar=calendar,
+                 value=tuple(dateval),
+                 text=date_data["text"],
+                 newyear=date_data["newyear"])
+        return _gregorian_year(date)
+    except Exception:
+        LOG.debug("could not convert a stored date to the Gregorian calendar",
+                  exc_info=True)
+        return year
 
 
 def _fold(text):
@@ -549,17 +601,11 @@ class AddParticipants(Gramplet):
             LOG.debug("could not index person %s", handle, exc_info=True)
 
     def _build_year_map(self, db):
-        """Event handle -> year, for every dated event, in a single query."""
+        """Event handle -> Gregorian year, for every dated event, in one query."""
         years = {}
         with db.get_event_cursor() as cursor:
             for _handle, data in cursor:
-                date = data["date"]
-                if not date:
-                    continue
-                dateval = date["dateval"]
-                if not dateval or len(dateval) <= 2:
-                    continue
-                year = dateval[2]
+                year = _raw_year(data["date"])
                 if year:
                     years[data["handle"]] = year
         return years
@@ -626,8 +672,24 @@ class AddParticipants(Gramplet):
                 others.append(marked)
         return others
 
-    def _raw_person_entry(self, data):
-        """(label, folded search text) straight from stored person data."""
+    @staticmethod
+    def _decorate(name, others, years):
+        """name [other names] (b. YYYY d. YYYY).
+
+        One place, so the raw and object paths cannot format the same person
+        differently - that byte-parity is what the tests hold them to.
+        """
+        label = name
+        if others:
+            label += " [%s]" % ", ".join(others)
+        marked = ["%s %d" % (marker, year)
+                  for marker, year in zip(("b.", "d."), years) if year]
+        if marked:
+            label += " (%s)" % " ".join(marked)
+        return label
+
+    def _raw_person_years(self, data):
+        """(birth year, death year) from stored data, via the year map."""
         refs = data["event_ref_list"]
         years = []
         for key in ("birth_ref_index", "death_ref_index"):
@@ -636,11 +698,16 @@ class AddParticipants(Gramplet):
             if index is not None and 0 <= index < len(refs):
                 year = self._index_years.get(refs[index]["ref"], 0)
             years.append(year)
-        self._index_lifespan[data["handle"]] = tuple(years)
-        label = self._raw_person_label(data)
+        return tuple(years)
+
+    def _raw_person_entry(self, data):
+        """(label, folded search text) straight from stored person data."""
+        years = self._raw_person_years(data)
+        self._index_lifespan[data["handle"]] = years
+        label = self._raw_person_label(data, years)
         return label, self._raw_person_search_text(data, label)
 
-    def _raw_person_label(self, data):
+    def _raw_person_label(self, data, years):
         """The object path's _person_label, without building a Person."""
         primary = data["primary_name"]
         alternates = data["alternate_names"]
@@ -651,22 +718,7 @@ class AddParticipants(Gramplet):
             [alt["first_name"] for alt in alternates],
             [_raw_surname(alt) for alt in alternates],
         )
-        years = []
-        refs = data["event_ref_list"]
-        for key, marker in (("birth_ref_index", "b."),
-                            ("death_ref_index", "d.")):
-            index = data[key]
-            if index is None or index < 0 or index >= len(refs):
-                continue
-            year = self._index_years.get(refs[index]["ref"])
-            if year:
-                years.append("%s %d" % (marker, year))
-        label = name
-        if others:
-            label += " [%s]" % ", ".join(others)
-        if years:
-            label += " (%s)" % " ".join(years)
-        return label
+        return self._decorate(name, others, years)
 
     def _raw_person_search_text(self, data, label):
         """The object path's _person_search_text, from stored data."""
@@ -701,8 +753,14 @@ class AddParticipants(Gramplet):
         # The completion is built from this list, so it has to be rebuilt.
         self.refresh_completion(force=True)
 
-    def _person_label(self, person):
-        """Primary name, any other surnames, then birth/death years."""
+    def _person_label(self, person, years=None):
+        """Primary name, any other surnames, then birth/death years.
+
+        `years` is the pair _person_entry has already read; passing it in
+        stops the birth and death events being fetched twice per person.
+        """
+        if years is None:
+            years = self._person_years(person)
         name = name_displayer.display(person)
         primary = person.get_primary_name()
         primary_surname = primary.get_surname() if primary else ""
@@ -713,26 +771,7 @@ class AddParticipants(Gramplet):
             [alt.get_first_name() for alt in alternates],
             [alt.get_surname() for alt in alternates],
         )
-        years = []
-        for ref, marker in (
-            (person.get_birth_ref(), "b."),
-            (person.get_death_ref(), "d."),
-        ):
-            year = ""
-            if ref:
-                event = self._get_event(ref.ref)
-                if event:
-                    date = event.get_date_object()
-                    if date and date.get_year():
-                        year = str(date.get_year())
-            if year:
-                years.append("%s %s" % (marker, year))
-        label = name
-        if others:
-            label += " [%s]" % ", ".join(others)
-        if years:
-            label += " (%s)" % " ".join(years)
-        return label
+        return self._decorate(name, others, years)
 
     def _person_search_text(self, person, label):
         """Every form of the name, folded, for the type-ahead to search.
@@ -751,20 +790,23 @@ class AddParticipants(Gramplet):
         parts.extend(self._index_spouses.get(person.get_handle(), ()))
         return _fold(" ".join(part for part in parts if part))
 
-    def _person_entry(self, person):
-        """(display label, folded search text) for one person."""
+    def _person_years(self, person):
+        """(birth year, death year) in the Gregorian calendar, 0 for unknown."""
         years = []
         for ref in (person.get_birth_ref(), person.get_death_ref()):
             year = 0
             if ref:
                 event = self._get_event(ref.ref)
-                if event:
-                    date = event.get_date_object()
-                    if date:
-                        year = date.get_year() or 0
+                if event is not None:
+                    year = _gregorian_year(event.get_date_object())
             years.append(year)
-        self._index_lifespan[person.get_handle()] = tuple(years)
-        label = self._person_label(person)
+        return tuple(years)
+
+    def _person_entry(self, person):
+        """(display label, folded search text) for one person."""
+        years = self._person_years(person)
+        self._index_lifespan[person.get_handle()] = years
+        label = self._person_label(person, years)
         return label, self._person_search_text(person, label)
 
     def _family_label(self, family):
@@ -905,13 +947,10 @@ class AddParticipants(Gramplet):
             self.completion_model.append([label, handle, search])
 
     def _event_year(self):
-        """Year of the selected event, or 0 when it is undated."""
+        """Gregorian year of the selected event, or 0 when it is undated."""
         if self.event is None:
             return 0
-        date = self.event.get_date_object()
-        if not date:
-            return 0
-        return date.get_year() or 0
+        return _gregorian_year(self.event.get_date_object())
 
     def _alive_at(self, handle, year):
         """True, False, or None when neither date is recorded.
