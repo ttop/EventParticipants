@@ -484,7 +484,11 @@ class AddParticipants(Gramplet):
                 self._index_years[handle] = year
             else:
                 self._index_years.pop(handle, None)
-        self._recache_people(sorted(self._event_people(handles)), removed=False)
+        people = self._event_people(handles)
+        if people:
+            # Re-caching re-sorts the whole index, so an event nobody
+            # references is not worth the trip.
+            self._recache_people(sorted(people), removed=False)
         self._reload_if_active(handles)
 
     def on_events_deleted(self, handles=None):
@@ -498,12 +502,13 @@ class AddParticipants(Gramplet):
         for handle in handles:
             self._index_years.pop(handle, None)
             self._index_fallbacks.pop(handle, None)
-        self._recache_people(sorted(people), removed=False)
+        if people:
+            self._recache_people(sorted(people), removed=False)
         if self.event_handle in handles:
             self.event = None
             self.event_handle = None
             self.model.clear()
-        self.update()
+            self.update()
 
     def _event_people(self, handles):
         """Everyone whose label or lifespan could quote one of these events."""
@@ -1502,7 +1507,9 @@ class AddParticipants(Gramplet):
         if handle in self._completion_excluded:
             # Not listed as a person, but covered by a participating family
             # - see _listed_person_handles.
-            self._report(_("%s already takes part through a family") % label)
+            self.status.set_text(
+                _("%s already takes part through a family") % label
+            )
             return
         self.model.append(
             [label, self._default_role(), STATE_NEW, handle,
