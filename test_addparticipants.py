@@ -1230,6 +1230,68 @@ check("the imported person is searchable (%d indexed)" % len(g.people_labels),
       "p2" in g.people_labels)
 check("the rebuild source was cleared", g._rebuild_id==0)
 
+print("\n[AJ] a family participant covers both its spouses")
+# A marriage is referenced by the Family, and the Events view counts both
+# spouses through it. Offering one of them again wrote a second, personal
+# reference at Primary and had the Main Participants column count them twice.
+g,db=make()
+db.people["h"]=Person("x", names=[Name("Bob","Brown")])
+db.people["w"]=Person("x", names=[Name("Jane","Brown")])
+db.families["f1"]=Family(father="h", mother="w")
+g.build_people_cache(); drain(g)
+g.model.append(row("Family: Bob & Jane","Family",ap.STATE_EXISTING,
+                   "f1","Family","Family",0))
+g.refresh_completion()
+check("both spouses are held to be listed already",
+      g._completion_excluded=={"h","w"})
+check("so neither is offered: %r" % [h for _l,h,_s in g._ranked_matches("Brown")],
+      g._ranked_matches("Brown")==[])
+g.stage_person("Brown, Bob","h")
+check("and staging one directly adds nothing (%d rows)" % len(g.model),
+      len(g.model)==1)
+check("...it says why instead: %r" % g.last_status,
+      "through a family" in str(g.last_status))
+# detaching the family releases them again
+g._set_state(g.model[0], ap.STATE_DETACH)
+g.refresh_completion()
+check("detaching the family offers the spouses back",
+      g._completion_excluded==frozenset())
+
+print("\n[AK] a role typed in the wrong case is snapped to the real one")
+g,db=make()
+g.role_model=_ListStore(str)
+for _n in ("Primary","Witness","Celebrant"): g.role_model.append([_n])
+g.model.append(row("Ann","Primary",ap.STATE_EXISTING,"p1","Person","Primary",0))
+g.update_status=lambda:None
+g.on_role_edited(None,"0","  primary ")
+check("'  primary ' becomes 'Primary': %r" % g.model[0][ap.COL_ROLE],
+      g.model[0][ap.COL_ROLE]=="Primary")
+check("...which is what the Main Participants column counts",
+      EventRoleType(g.model[0][ap.COL_ROLE]).is_primary())
+g.on_role_edited(None,"0","WITNESS")
+check("'WITNESS' becomes 'Witness': %r" % g.model[0][ap.COL_ROLE],
+      g.model[0][ap.COL_ROLE]=="Witness")
+g.on_role_edited(None,"0","Pallbearer")
+check("a genuinely new role is still allowed through: %r"
+      % g.model[0][ap.COL_ROLE], g.model[0][ap.COL_ROLE]=="Pallbearer")
+check("...and Gramps makes it a custom role",
+      EventRoleType("Pallbearer").is_custom())
+g.on_role_edited(None,"0","   ")
+check("blank input leaves the role alone: %r" % g.model[0][ap.COL_ROLE],
+      g.model[0][ap.COL_ROLE]=="Pallbearer")
+
+print("\n[AL] re-picking a doubly detached person restores both rows")
+g,db=make()
+db.people["p1"]=Person("x", names=[Name("Ann","Lee")])
+g.build_people_cache(); drain(g)
+g.model.append(row("Lee, Ann","Witness",ap.STATE_DETACH,"p1","Person","Witness",0))
+g.model.append(row("Lee, Ann","Primary",ap.STATE_DETACH,"p1","Person","Primary",1))
+g.stage_person("Lee, Ann","p1")
+check("both detachments were undone: %r"
+      % [r[ap.COL_STATE] for r in g.model],
+      all(r[ap.COL_STATE]==ap.STATE_EXISTING for r in g.model))
+check("and no third row was invented (%d)" % len(g.model), len(g.model)==2)
+
 print("\n[AB] a change that lands during the index build is not clobbered")
 # The raw build walks a snapshot of the table taken at build_people_cache time.
 # A person whose name changed after that snapshot must keep the fresh name

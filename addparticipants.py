@@ -1167,6 +1167,32 @@ class AddParticipants(Gramplet):
                 )
                 nth += 1
 
+    def _listed_person_handles(self):
+        """Everyone the participant list already covers.
+
+        A participating family's reference stands for both its spouses, and
+        that is how the Events view counts them, so offering one of them
+        again is offering a duplicate: accepting it writes a second,
+        personal reference at Primary and the Main Participants column
+        counts them twice. Attaching a spouse in their own right, with a
+        role of their own, is still possible the stock way.
+        """
+        listed = set()
+        for row in self.model:
+            if row[COL_STATE] == STATE_DETACH:
+                continue
+            if row[COL_KIND] == "Person":
+                listed.add(row[COL_HANDLE])
+            elif row[COL_KIND] == "Family":
+                family = self._get_family(row[COL_HANDLE])
+                if family is None:
+                    continue
+                for handle in (family.get_father_handle(),
+                               family.get_mother_handle()):
+                    if handle:
+                        listed.add(handle)
+        return frozenset(listed)
+
     def refresh_completion(self, force=False):
         """Note who is already listed and refresh what the type-ahead offers.
 
@@ -1174,11 +1200,7 @@ class AddParticipants(Gramplet):
         of excluded people actually moved. Callers that changed the people
         cache itself pass force=True.
         """
-        listed = frozenset(
-            row[COL_HANDLE]
-            for row in self.model
-            if row[COL_KIND] == "Person" and row[COL_STATE] != STATE_DETACH
-        )
+        listed = self._listed_person_handles()
         if not force and listed == self._completion_excluded:
             return
         self._completion_excluded = listed
@@ -1324,16 +1346,24 @@ class AddParticipants(Gramplet):
         known = self.people_labels.get(handle)
         if known:
             label = known[0]
-        for row in self.model:
-            if row[COL_HANDLE] == handle and row[COL_KIND] == "Person":
-                # refresh_completion() keeps detach-staged people in the
-                # type-ahead, so picking one again has to mean "undo the
-                # detach" rather than silently doing nothing.
+        rows = [row for row in self.model
+                if row[COL_HANDLE] == handle and row[COL_KIND] == "Person"]
+        if rows:
+            # refresh_completion() keeps detach-staged people in the
+            # type-ahead, so picking one again has to mean "undo the detach"
+            # rather than silently doing nothing - and for every row of
+            # theirs, since an object can hold two references to one event.
+            for row in rows:
                 if row[COL_STATE] == STATE_DETACH:
                     self._set_state(row, STATE_EXISTING)
-                    self.refresh_completion()
-                    self.update_status()
-                return
+            self.refresh_completion()
+            self.update_status()
+            return
+        if handle in self._completion_excluded:
+            # Not listed as a person, but covered by a participating family
+            # - see _listed_person_handles.
+            self._report(_("%s already takes part through a family") % label)
+            return
         self.model.append(
             [label, self._default_role(), STATE_NEW, handle,
              "Person", "", -1, int(Pango.Weight.BOLD),
@@ -1370,13 +1400,36 @@ class AddParticipants(Gramplet):
         completion.set_inline_completion(True)
         entry.set_completion(completion)
 
+    def _canonical_role(self, text):
+        """Snap a typed role onto a known one, ignoring case and padding.
+
+        EventRoleType(name) is an exact string lookup
+        (gen/lib/grampstype.py:203): "primary" does not become PRIMARY, it
+        mints a CUSTOM role that keeps the string, and a custom role's
+        is_primary() is False - so the participant vanishes from the Events
+        view's Main Participants column with nothing to show why. A
+        genuinely new spelling still creates a custom role, which is the
+        supported way to get one, but only after failing to match anything
+        already in the list.
+        """
+        cleaned = " ".join(text.split())
+        if not cleaned:
+            return ""
+        folded = cleaned.casefold()
+        for row in self.role_model:
+            known = row[0]
+            if known and known.casefold() == folded:
+                return known
+        return cleaned
+
     def on_role_edited(self, _cell, path, new_text):
-        if not new_text:
+        role = self._canonical_role(new_text or "")
+        if not role:
             return
         row = self.model[path]
         if row[COL_STATE] == STATE_DETACH:
             return
-        row[COL_ROLE] = new_text
+        row[COL_ROLE] = role
         self.update_status()
 
     def on_remove(self, _button):
