@@ -14,7 +14,25 @@ Requires **Gramps 6.0**. GPL v2 (see [LICENSE](LICENSE)).
 
 ## Installing
 
-Copy or symlink `eventparticipants.py` and `eventparticipants.gpr.py` into a directory of their own under your Gramps user plugins folder:
+### Through the Addon Manager
+
+Gramps 6.0 can install from any addon *project*, not just the official one — the official listing is registered by exactly the same mechanism, so a third-party project is not second-class. Adding this repo as one gets you one-click install and version-checked updates afterwards.
+
+1. **Edit → Addon Manager...**
+2. On the **Projects** tab, press **+** and fill in:
+
+   | Project name | `Event Participants` |
+   |---|---|
+   | URL | `https://raw.githubusercontent.com/ttop/EventParticipants/main/gramps60` |
+
+3. Back on the **Addons** tab, find **Event Participants** and press **Install**.
+4. Restart Gramps.
+
+The project is generated from the registration by [`build_addon.py`](build_addon.py), which writes the two files the Addon Manager asks for — `gramps60/listings/addons-en.json` and `gramps60/download/EventParticipants.addon.tgz`. Any `file://` path works as a project URL too, so a local build can be tested the same way before it is pushed.
+
+### From source
+
+Or copy `eventparticipants.py` and `eventparticipants.gpr.py` into a directory of their own under your Gramps user plugins folder:
 
 | Platform | Plugins folder |
 |---|---|
@@ -29,6 +47,10 @@ mkdir -p ~/.local/share/gramps/gramps60/plugins/EventParticipants
 cp eventparticipants.py eventparticipants.gpr.py \
    ~/.local/share/gramps/gramps60/plugins/EventParticipants/
 ```
+
+Symlinking instead of copying works too, and makes edits live with no copy step.
+
+### Either way
 
 Restart Gramps fully — it does not pick up new plugin code otherwise. Then go to the **Events** view, right-click the bottombar tab strip, and choose **Event Participants**.
 
@@ -111,3 +133,7 @@ python3 test_eventparticipants.py
 ```
 
 No framework needed.
+
+## Releasing
+
+Bump `version` in `eventparticipants.gpr.py`, run `python3 build_addon.py`, and commit the regenerated files under `gramps60/`. The listing takes its version, status and description straight from the registration, so the two cannot drift. Anyone who has added the project sees the new version on their next update check.
