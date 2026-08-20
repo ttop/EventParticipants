@@ -301,6 +301,7 @@ class FakeDb:
     """
     def __init__(self):
         self.people={}; self.events={}; self.families={}; self.emitted=[]
+        self.committed_events=[]
     def _ref_index(self, person, handle):
         for i,r in enumerate(person.refs):
             if r.ref==handle: return i
@@ -340,6 +341,8 @@ class FakeDb:
             for h,p in self.people.items():
                 if any(r.ref==handle for r in p.refs):
                     yield ("Person", h)
+    def commit_event(self, event, trans, change_time=None):
+        self.committed_events.append(event)
     def emit(self, signal, args): self.emitted.append((signal, args))
     def get_person_handles(self, sort_handles=False): return list(self.people)
     def is_open(self): return True
@@ -610,6 +613,9 @@ check("...which is what the Main Participants column counts",
       EventRoleType(EventRoleType.PRIMARY).is_primary())
 
 print("\n[N] Apply nudges the Events view to re-read the row")
+# The event is committed inside the transaction, which makes Gramps emit
+# event-update itself - and replay it on undo and redo, which emitting it
+# by hand afterwards never did.
 g,db=make()
 p=Person("Ann",refs=[])
 db.people["p1"]=p; db.events["E1"]=Ev(500)
@@ -619,8 +625,8 @@ g.load_participants=lambda:None; g.refresh_completion=lambda force=False:None
 g.update_status=lambda:None
 g.on_apply(None)
 check("the reference was actually added", len(p.refs)==1)
-check("event-update emitted for this event, got %r" % db.emitted,
-      ("event-update",(["E1"],)) in db.emitted)
+check("the event was committed in the same transaction, got %r"
+      % db.committed_events, db.committed_events==[db.events["E1"]])
 
 print("\n[O] the nudge also happens on detach, which stock Gramps misses")
 g,db=make()
@@ -632,8 +638,59 @@ g.load_participants=lambda:None; g.refresh_completion=lambda force=False:None
 g.update_status=lambda:None
 g.on_apply(None)
 check("the reference was removed", len(p.refs)==0)
-check("event-update still emitted, got %r" % db.emitted,
-      ("event-update",(["E1"],)) in db.emitted)
+check("the event was committed here too, got %r" % db.committed_events,
+      db.committed_events==[db.events["E1"]])
+
+print("\n[O2] Apply reports what it actually did")
+g,db=make()
+p=Person("Cal",refs=[Ref("E1","Primary")])
+db.people["p1"]=p; db.events["E1"]=Ev(500)
+g.event=Ev(500); g.event.get_handle=lambda:"E1"
+# A row whose reference has gone from under us: the record now holds one
+# reference to this event, but the model believes it holds two.
+g.model.append(row("Cal","Witness",ap.STATE_EXISTING,"p1","Person","Primary",0))
+g.model.append(row("Cal","Witness",ap.STATE_EXISTING,"p1","Person","Primary",1))
+g.load_participants=lambda:None; g.refresh_completion=lambda force=False:None
+g.update_status=lambda:None
+g.on_apply(None)
+check("the surviving reference was re-roled: %r" % str(p.refs[0].role),
+      str(p.refs[0].role)=="Witness")
+check("one change was applied, not two: %r" % g.last_status,
+      "1 role change" in str(g.last_status))
+check("and the one that no longer matched is owned up to: %r" % g.last_status,
+      "no longer matched" in str(g.last_status))
+
+# the row's identity is which reference to *this* event it is, so an
+# unrelated reference appearing before it does not misdirect the edit
+g,db=make()
+p=Person("Dot",refs=[Ref("E1","Primary"),Ref("E9","Primary")])
+db.people["p1"]=p; db.events["E1"]=Ev(500); db.events["E9"]=Ev(100)
+g.event=Ev(500); g.event.get_handle=lambda:"E1"
+g.model.append(row("Dot","Witness",ap.STATE_EXISTING,"p1","Person","Primary",0))
+p.refs.insert(0, Ref("E7","Primary"))       # added elsewhere since the load
+g.load_participants=lambda:None; g.refresh_completion=lambda force=False:None
+g.update_status=lambda:None
+g.on_apply(None)
+check("the edit landed on the right reference: %r"
+      % [(r.ref,str(r.role)) for r in p.refs],
+      str(p.refs[1].role)=="Witness" and str(p.refs[0].role)=="Primary")
+check("and it was counted as applied: %r" % g.last_status,
+      "1 role change" in str(g.last_status)
+      and "no longer matched" not in str(g.last_status))
+
+print("\n[O3] Apply refuses to write to an event that has gone")
+g,db=make()
+p=Person("Eve",refs=[])
+db.people["p1"]=p                              # no db.events["E1"]
+g.event=Ev(500); g.event.get_handle=lambda:"E1"
+g.model.append(row("Eve","Primary",ap.STATE_NEW,"p1","Person","",-1))
+g.load_participants=lambda:None; g.refresh_completion=lambda force=False:None
+g.update_status=lambda:None
+g.on_apply(None)
+check("no reference was written", len(p.refs)==0)
+check("nothing was committed", g.commits==[] and db.committed_events==[])
+check("and it says why: %r" % g.last_status,
+      "no longer exists" in str(g.last_status))
 
 print("\n[P] the name index builds in the background, not in one blocking pass")
 g,db=make()

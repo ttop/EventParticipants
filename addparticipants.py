@@ -50,7 +50,7 @@ COL_STATE = 2      # internal token, never shown
 COL_HANDLE = 3
 COL_KIND = 4       # "Person" or "Family"
 COL_ORIG_ROLE = 5
-COL_REFIDX = 6     # index into the object's event_ref_list, -1 for new
+COL_REFNTH = 6     # which of this object's refs to the event, -1 for new
 COL_WEIGHT = 7     # bold for staged additions
 COL_STATE_TEXT = 8  # translated text for the state column
 
@@ -1134,6 +1134,10 @@ class AddParticipants(Gramplet):
                 db.find_backlink_handles(ev_handle, ["Person", "Family"])
             )
         except Exception:
+            # An empty list here reads as "nobody is attached to this event",
+            # which is exactly what a broken lookup must not be mistaken for.
+            LOG.exception("Add Participants: could not read the participants "
+                          "of event %s", ev_handle)
             backlinks = []
 
         for class_name, handle in backlinks:
@@ -1147,15 +1151,21 @@ class AddParticipants(Gramplet):
                 continue
             if obj is None:
                 continue
-            for index, ref in enumerate(obj.get_event_ref_list()):
+            # Rows record *which* of this object's references to this event
+            # they stand for, not where it sits in the whole list: an
+            # unrelated reference added or removed elsewhere shifts the raw
+            # index but not this.
+            nth = 0
+            for ref in obj.get_event_ref_list():
                 if ref.ref != ev_handle:
                     continue
                 role = str(ref.get_role())
                 self.model.append(
                     [label, role, STATE_EXISTING, handle,
-                     class_name, role, index, int(Pango.Weight.NORMAL),
+                     class_name, role, nth, int(Pango.Weight.NORMAL),
                      STATE_TEXT[STATE_EXISTING]]
                 )
+                nth += 1
 
     def refresh_completion(self, force=False):
         """Note who is already listed and refresh what the type-ahead offers.
@@ -1419,110 +1429,157 @@ class AddParticipants(Gramplet):
     # Apply
     # ------------------------------------------------------------------
 
+    def _report(self, message):
+        """Say something that must not be missed.
+
+        The gramplet's own status line, and the main window's status bar
+        (gui/displaystate.py:697) for the case where the gramplet is not the
+        thing being looked at.
+        """
+        self._notice = message
+        self.status.set_text(message)
+        try:
+            self.uistate.push_message(self.dbstate, message)
+        except Exception:
+            LOG.debug("could not push a status message", exc_info=True)
+
     def on_apply(self, _button):
         if self.event is None:
             return
-        additions, detachments, role_changes = self.pending_counts()
-        if not (additions or detachments or role_changes):
+        if not any(self.pending_counts()):
             return
 
         db = self.dbstate.db
         ev_handle = self.event.get_handle()
-        new_sort = self._sort_value(self.event)
+        # Re-read the event: it may have been edited, or deleted, since it
+        # was selected. Its date decides where a new reference is inserted,
+        # and committing references to an event that is gone would leave
+        # every one of them dangling.
+        event = self._get_event(ev_handle)
+        if event is None:
+            self._report(_("That event no longer exists; nothing was changed."))
+            return
+        self.event = event
+        new_sort = self._sort_value(event)
 
         # Snapshot the model before touching the database, grouped by object
         # so each person or family is read, changed and committed exactly
         # once. An object holding two references to the same event produces
-        # two rows, and those are told apart by COL_REFIDX rather than by
+        # two rows, and those are told apart by COL_REFNTH rather than by
         # handle alone.
         by_object = {}
         for row in self.model:
             by_object.setdefault((row[COL_KIND], row[COL_HANDLE]), []).append(
                 (row[COL_ROLE], row[COL_ORIG_ROLE], row[COL_STATE],
-                 row[COL_REFIDX])
+                 row[COL_REFNTH])
             )
 
+        # Counted as they happen rather than read off the model beforehand:
+        # a row whose reference has moved under us is skipped, and saying
+        # "applied" for it would be a lie.
+        added = detached = rerolled = skipped = 0
+        sort_values = {}
+        self._applying = True
         try:
             with DbTxn(_("Edit participants of event"), db) as trans:
                 for (kind, handle), entries in by_object.items():
                     obj = self._get_object(kind, handle)
                     if obj is None:
+                        skipped += len(entries)
                         continue
 
                     refs = list(obj.get_event_ref_list())
+                    # Where this object's references to *this* event sit now.
+                    # Rows name which of them they mean, so an unrelated
+                    # reference appearing or going elsewhere in the list
+                    # cannot land an edit on the wrong reference.
+                    positions = [index for index, ref in enumerate(refs)
+                                 if ref.ref == ev_handle]
                     changed = False
 
-                    # Roles first: they address a ref by its original index,
-                    # so they must run before a detach shifts the list.
-                    for role, orig_role, state, refidx in entries:
+                    # Roles first: they address a ref by position, so they
+                    # must run before a detach shifts the list.
+                    for role, orig_role, state, nth in entries:
                         if state != STATE_EXISTING or role == orig_role:
                             continue
-                        ref = self._ref_at(refs, refidx, ev_handle)
-                        if ref is not None:
-                            ref.set_role(EventRoleType(role))
+                        if 0 <= nth < len(positions):
+                            refs[positions[nth]].set_role(EventRoleType(role))
+                            rerolled += 1
                             changed = True
+                        else:
+                            skipped += 1
 
-                    # Then detachments, highest index first for the same reason.
-                    for refidx in sorted(
-                        (entry[3] for entry in entries
-                         if entry[2] == STATE_DETACH),
-                        reverse=True,
-                    ):
-                        if self._ref_at(refs, refidx, ev_handle) is not None:
-                            del refs[refidx]
-                            changed = True
+                    # Then detachments, highest position first for the same
+                    # reason.
+                    doomed = []
+                    for _role, _orig, state, nth in entries:
+                        if state != STATE_DETACH:
+                            continue
+                        if 0 <= nth < len(positions):
+                            doomed.append(positions[nth])
+                        else:
+                            skipped += 1
+                    for position in sorted(set(doomed), reverse=True):
+                        del refs[position]
+                        detached += 1
+                        changed = True
 
                     # Additions last, so _insert_index sees the final list.
-                    for role, orig_role, state, refidx in entries:
+                    for role, _orig, state, _nth in entries:
                         if state != STATE_NEW:
                             continue
                         if any(ref.ref == ev_handle for ref in refs):
+                            # Attached from somewhere else in the meantime.
+                            skipped += 1
                             continue
                         eref = EventRef()
                         eref.set_reference_handle(ev_handle)
                         eref.set_role(EventRoleType(role))
-                        refs.insert(self._insert_index(refs, new_sort), eref)
+                        refs.insert(
+                            self._insert_index(refs, new_sort, sort_values),
+                            eref,
+                        )
+                        added += 1
                         changed = True
 
                     if changed:
                         obj.set_event_ref_list(refs)
                         self._commit_object(kind, obj, trans)
+
+                # Touch the event itself, inside the transaction. Nothing
+                # else tells the Events view that its cached Main
+                # Participants column is stale: it watches person-update, but
+                # its handler walks each person's *current* references
+                # (plugins/view/eventview.py:156) and so cannot see one we
+                # just removed. Committing the event here makes the
+                # transaction emit event-update on its own
+                # (plugins/db/dbapi/dbapi.py:356) and, unlike emitting it by
+                # hand afterwards, undo and redo replay it
+                # (gen/db/generic.py:288) - so undoing an addition no longer
+                # leaves the column overstating the count.
+                if added or detached or rerolled:
+                    db.commit_event(event, trans)
         except Exception as err:
             # DbTxn.__exit__ has already aborted the transaction, so the
             # database is untouched. An exception raised from a GTK callback
             # would otherwise reach the user as nothing at all: keep the
             # pending edits on screen and say what went wrong.
             LOG.exception("Add Participants: applying changes failed")
-            message = _("Could not apply changes: %s") % err
-            self.status.set_text(message)
-            self.uistate.push_message(self.dbstate, message)
+            self._report(_("Could not apply changes: %s") % err)
             return
-
-        # The event object itself never changed, so nothing has told the
-        # Events view that its cached Main Participants column is stale.
-        # That view does watch person-update, but its handler walks each
-        # person's *current* event refs (plugins/view/eventview.py:156), so
-        # it cannot see a reference we just removed. Nudge the row directly;
-        # this covers additions, role changes and detachments alike.
-        try:
-            db.emit("event-update", ([ev_handle],))
-        except Exception:
-            LOG.debug("could not emit event-update", exc_info=True)
+        finally:
+            self._applying = False
 
         self.load_participants()
         self.refresh_completion()
         self.update_status()
-        self.status.set_text(
-            _("Applied: +%d, %d role change(s), -%d")
-            % (additions, role_changes, detachments)
-        )
-
-    @staticmethod
-    def _ref_at(refs, refidx, ev_handle):
-        """The ref a row stands for, or None if it no longer lines up."""
-        if 0 <= refidx < len(refs) and refs[refidx].ref == ev_handle:
-            return refs[refidx]
-        return None
+        message = _("Applied: +%(add)d, %(role)d role change(s), -%(detach)d") \
+            % {"add": added, "role": rerolled, "detach": detached}
+        if skipped:
+            message += " " + (
+                _("(%d change(s) no longer matched the record)") % skipped
+            )
+        self.status.set_text(message)
 
     def _get_object(self, kind, handle):
         if kind == "Person":
@@ -1542,15 +1599,24 @@ class AddParticipants(Gramplet):
         date = event.get_date_object()
         return date.get_sort_value() if date else 0
 
-    def _insert_index(self, refs, new_sort):
-        """Chronological position. Undated events keep their place."""
+    def _insert_index(self, refs, new_sort, sort_values=None):
+        """Chronological position. Undated events keep their place.
+
+        `sort_values` memoises the event reads across one apply. Without it
+        every addition re-read every event in that person's list, inside the
+        transaction; sort values are a property of the event, so one cache
+        serves every person in the batch.
+        """
         if not new_sort:
             return len(refs)
+        if sort_values is None:
+            sort_values = {}
         for index, ref in enumerate(refs):
-            event = self._get_event(ref.ref)
-            if event is None:
-                continue
-            sort_value = self._sort_value(event)
+            sort_value = sort_values.get(ref.ref)
+            if sort_value is None:
+                event = self._get_event(ref.ref)
+                sort_value = self._sort_value(event) if event is not None else 0
+                sort_values[ref.ref] = sort_value
             if sort_value and sort_value > new_sort:
                 return index
         return len(refs)
