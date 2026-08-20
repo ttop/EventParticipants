@@ -227,9 +227,14 @@ class AddParticipants(Gramplet):
         self._index_touched = set() # changed since the snapshot, build skips them
         self._index_raw = False     # reading raw data rather than objects
         self._index_years = {}      # event handle -> year, for labels
+        self._index_fallbacks = {}  # event handle -> birth/death fallback type
         self._index_spouses = {}    # person handle -> spouse surnames
+        self._index_mothers = {}    # family handle -> its wife's handle
         self._index_lifespan = {}   # person handle -> (birth year, death year)
         self._not_living = 0        # left out of the last search by date
+        self._rebuild_id = 0        # idle source coalescing bulk rebuilds
+        self._applying = False      # inside our own apply transaction
+        self._notice = ""           # one-shot message for the status label
         self.gui.WIDGET = self.build_gui()
         container = self.gui.get_container_widget()
         if self.gui.textview in container.get_children():
@@ -350,9 +355,47 @@ class AddParticipants(Gramplet):
         self.connect(self.dbstate.db, "person-add", self.on_people_changed)
         self.connect(self.dbstate.db, "person-update", self.on_people_changed)
         self.connect(self.dbstate.db, "person-delete", self.on_people_deleted)
+        # A married surname lives on the family record, not on the wife, so
+        # a family edit can change the name she is searchable under without
+        # any person-update ever naming her.
+        self.connect(self.dbstate.db, "family-add", self.on_families_changed)
+        self.connect(self.dbstate.db, "family-update", self.on_families_changed)
+        self.connect(self.dbstate.db, "family-delete", self.on_families_changed)
+        # Labels quote birth and death years, the alive filter compares
+        # against the selected event's year, and the chronological insert
+        # position is read off it - all of which go stale when an event is
+        # edited. active-changed cannot cover this: it only fires when the
+        # handle changes (gui/views/navigationview.py:206).
+        self.connect(self.dbstate.db, "event-update", self.on_events_changed)
+        self.connect(self.dbstate.db, "event-delete", self.on_events_deleted)
+        # Importers run with signals disabled and announce the result with
+        # request_rebuild() alone (gen/db/generic.py:2646), so without these
+        # a GEDCOM import into the open tree leaves every imported person
+        # unsearchable until the tree is reopened.
+        self.connect(self.dbstate.db, "person-rebuild", self.on_tree_rebuilt)
+        self.connect(self.dbstate.db, "family-rebuild", self.on_tree_rebuilt)
+        self.connect(self.dbstate.db, "event-rebuild", self.on_tree_rebuilt)
         self.connect_signal("Event", self.update)
         self.build_people_cache()
         self.build_role_model()
+
+    def on_tree_rebuilt(self, *_args):
+        """A bulk change that names no handles: rebuild everything.
+
+        request_rebuild() fires person-, family- and event-rebuild one after
+        another, so coalesce them onto a single idle turn rather than
+        rescanning the whole tree three times over.
+        """
+        if self._rebuild_id:
+            return
+        self._rebuild_id = GLib.idle_add(
+            self._do_rebuild, priority=GLib.PRIORITY_LOW
+        )
+
+    def _do_rebuild(self):
+        self._rebuild_id = 0
+        self.build_people_cache()
+        return False
 
     def on_people_changed(self, handles=None):
         """Refresh only the people that actually changed.
@@ -366,6 +409,104 @@ class AddParticipants(Gramplet):
     def on_people_deleted(self, handles=None):
         self._recache_people(handles, removed=True)
 
+    def on_events_changed(self, handles=None):
+        """Re-read events whose dates other things quote.
+
+        Every year this gramplet shows or compares comes from an event, and
+        nothing else tells it when one moves: the header, the year _alive_at()
+        judges against, the years in every label, and the position a new
+        reference is inserted at.
+        """
+        if self._applying:
+            # Our own transaction is the source. on_apply refreshes the list
+            # itself, and re-running main() here would wipe its result.
+            return
+        if handles is None:
+            self.build_people_cache()
+            return
+        for handle in handles:
+            event = self._get_event(handle)
+            year = 0 if event is None else _gregorian_year(
+                event.get_date_object())
+            if year:
+                self._index_years[handle] = year
+            else:
+                self._index_years.pop(handle, None)
+        self._recache_people(sorted(self._event_people(handles)), removed=False)
+        self._reload_if_active(handles)
+
+    def on_events_deleted(self, handles=None):
+        """An event can go from under us - a delete, a merge, an undo."""
+        if self._applying:
+            return
+        if handles is None:
+            self.build_people_cache()
+            return
+        people = self._event_people(handles)
+        for handle in handles:
+            self._index_years.pop(handle, None)
+            self._index_fallbacks.pop(handle, None)
+        self._recache_people(sorted(people), removed=False)
+        if self.event_handle in handles:
+            self.event = None
+            self.event_handle = None
+            self.model.clear()
+        self.update()
+
+    def _event_people(self, handles):
+        """Everyone whose label or lifespan could quote one of these events."""
+        people = set()
+        for handle in handles:
+            try:
+                for _class_name, person in self.dbstate.db.find_backlink_handles(
+                        handle, ["Person"]):
+                    people.add(person)
+            except Exception:
+                LOG.debug("no backlinks for event %s", handle, exc_info=True)
+        return people
+
+    def _reload_if_active(self, handles):
+        """Refresh the view when the event it is showing was the one that
+        changed. Pending edits are kept: they address the *people*, not the
+        event, so they stay valid - but the list itself is only reloaded
+        when there is nothing staged to lose."""
+        if self.event_handle not in handles:
+            return
+        if any(self.pending_counts()):
+            self._notice = _("This event changed elsewhere; "
+                             "Revert reloads the list")
+        else:
+            # Forces load_participants() on the way through main().
+            self.event_handle = None
+        self.update()
+
+    def on_families_changed(self, handles=None):
+        """A wife's married surname comes from the family, so keep it in step.
+
+        Deleting or unlinking a husband commits the family but never the
+        wife, and no person-update ever names her: without this she stays
+        searchable, and labelled, under a surname she is no longer known by.
+        """
+        if handles is None:
+            self.build_people_cache()
+            return
+        wives = set()
+        for handle in handles:
+            # The wife the family used to have, for the case where the
+            # family itself is gone and cannot be asked any more.
+            previous = self._index_mothers.pop(handle, None)
+            if previous:
+                wives.add(previous)
+            family = self._get_family(handle)
+            if family is None:
+                continue
+            mother = family.get_mother_handle()
+            if mother:
+                self._index_mothers[handle] = mother
+                wives.add(mother)
+        if wives:
+            self._recache_people(sorted(wives), removed=False)
+
     def _recache_people(self, handles, removed):
         if handles is None:
             self.build_people_cache()
@@ -374,9 +515,16 @@ class AddParticipants(Gramplet):
         # Read each touched person once; the spouse lookups below reuse it, so
         # a person with no families still costs a single read, as before.
         people = {}
+
+        def person_at(handle):
+            """The person behind a handle, read at most once per call."""
+            if handle not in people:
+                people[handle] = self._get_person(handle)
+            return people[handle]
+
         for handle in handles:
             if handle not in removed_set:
-                people[handle] = self._get_person(handle)
+                person_at(handle)
         # Rebuild the labels of the touched people plus any spouse whose
         # married-surname set depends on one of them: a new or renamed husband
         # changes the name his wives are searchable by, and a new wife gains
@@ -392,19 +540,16 @@ class AddParticipants(Gramplet):
             if handle in removed_set:
                 self._index_spouses.pop(handle, None)
                 continue
-            person = people.get(handle)
-            if person is None:
-                person = self._get_person(handle)
+            person = person_at(handle)
             if person is not None:
                 self._index_spouses[handle] = self._spouse_surnames_for(
                     handle, person)
         for handle in to_cache:
             self.people_labels.pop(handle, None)
             if handle in removed_set:
+                self._index_lifespan.pop(handle, None)
                 continue
-            person = people.get(handle)
-            if person is None:
-                person = self._get_person(handle)
+            person = person_at(handle)
             if person is not None:
                 self.people_labels[handle] = self._person_entry(person)
         if self._index_id:
@@ -493,6 +638,7 @@ class AddParticipants(Gramplet):
         db = self.dbstate.db
         self.people_labels = {}
         self._index_lifespan = {}
+        self._index_mothers = {}
         self._index_touched = set()
         self._sort_people_cache()
         if db is None or not db.is_open():
@@ -664,6 +810,10 @@ class AddParticipants(Gramplet):
         not the reverse, so the surname is never exchanged - a husband must
         not become findable under his wife's maiden name. Matching both ways
         turned a search for "John Joy" into every John married to a Joy.
+
+        It also fills _index_mothers on the way past, which is how
+        on_families_changed finds the wife of a family that has since been
+        deleted and can no longer be asked.
         """
         if surname_by_handle is None:
             surname_by_handle = {
@@ -672,15 +822,19 @@ class AddParticipants(Gramplet):
                 for person in db.iter_people()
             }
         spouses = {}
+        mothers = {}
         with db.get_family_cursor() as cursor:
             for _handle, data in cursor:
                 father = data["father_handle"]
                 mother = data["mother_handle"]
+                if mother:
+                    mothers[data["handle"]] = mother
                 if not father or not mother:
                     continue
                 surname = surname_by_handle.get(father)
                 if surname and surname != surname_by_handle.get(mother):
                     spouses.setdefault(mother, set()).add(surname)
+        self._index_mothers = mothers
         return {handle: sorted(names) for handle, names in spouses.items()}
 
     def _other_names(self, handle, primary_given, primary_surname,
@@ -1255,7 +1409,10 @@ class AddParticipants(Gramplet):
             parts.append(_("%d role change(s)") % role_changes)
         if detachments:
             parts.append(_("%d to detach") % detachments)
-        self.status.set_text(", ".join(parts))
+        # A notice is one-shot: it fills the label only while there is
+        # nothing pending to report, and never survives a second refresh.
+        notice, self._notice = self._notice, ""
+        self.status.set_text(", ".join(parts) if parts else notice)
         self.apply_btn.set_sensitive(bool(parts) and self.event is not None)
 
     # ------------------------------------------------------------------

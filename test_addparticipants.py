@@ -333,6 +333,13 @@ class FakeDb:
                                  "modifier":d.modifier,"text":d.text,
                                  "newyear":d.newyear,"sortval":d.sortval}})
         return _Cursor(rows)
+    def find_backlink_handles(self, handle, include_classes=None):
+        """(class, handle) for everything referencing an event. Only people
+        carry event references in these stubs."""
+        if include_classes is None or "Person" in include_classes:
+            for h,p in self.people.items():
+                if any(r.ref==handle for r in p.refs):
+                    yield ("Person", h)
     def emit(self, signal, args): self.emitted.append((signal, args))
     def get_person_handles(self, sort_handles=False): return list(self.people)
     def is_open(self): return True
@@ -366,8 +373,21 @@ def make():
     g._index_id=0; g._index_iter=None; g._index_spouses={}
     g._completion_excluded=frozenset(); g._matches=[]; g.typed=""
     g._index_lifespan={}; g._not_living=0
-    g.event=None; g.last_status=None; g.placeholder=None
+    g._index_years={}; g._index_fallbacks={}; g._index_mothers={}
+    g._rebuild_id=0; g._applying=False; g._notice=""
+    g.event=None; g.event_handle=None
+    g.last_status=None; g.placeholder=None
+    g.updates=0
+    g.update=lambda: setattr(g,"updates",g.updates+1)
     return g,db
+
+def run_idle(sid):
+    """Run one pending GLib idle callback, the way the main loop would."""
+    cb=GLib._sources.get(sid)
+    if cb is None: return False
+    while cb(): pass
+    GLib._sources.pop(sid,None)
+    return True
 
 def row(name,role,state,handle,kind,orig,refidx):
     return [name,role,state,handle,kind,orig,refidx,400,ap.STATE_TEXT[state]]
@@ -1044,6 +1064,114 @@ for _force in (False, True):
           g._index_lifespan["p1"]==(0,0))
     check("%s: so she is never ruled out" % path,
           g._alive_at("p1",1990) is None)
+
+print("\n[AF] an event edited elsewhere is noticed")
+g,db=make()
+db.events["b1"]=Ev(0,1850)
+db.people["p1"]=Person("x", names=[Name("Sarah","Fisher")],
+                       b="b1", refs=[Ref("b1")])
+g.build_people_cache(); drain(g)
+check("indexed with the year it had: %r" % g.people_labels["p1"][0],
+      "1850" in g.people_labels["p1"][0])
+db.events["b1"]=Ev(0,1860)                     # the birth date was corrected
+g.on_events_changed(["b1"])
+check("the year map followed the edit (%r)" % g._index_years.get("b1"),
+      g._index_years.get("b1")==1860)
+check("so did the label: %r" % g.people_labels["p1"][0],
+      "1860" in g.people_labels["p1"][0])
+check("and the lifespan the alive filter reads: %r" % (g._index_lifespan["p1"],),
+      g._index_lifespan["p1"]==(1860,0))
+
+# the selected event's own date moving refreshes the view
+g,db=make()
+db.events["E1"]=Ev(500,1900)
+g.event=db.events["E1"]; g.event_handle="E1"
+g.on_events_changed(["E1"])
+check("the active event's change triggers a refresh (%d)" % g.updates,
+      g.updates==1)
+check("...and the list is reloaded, since nothing was staged",
+      g.event_handle is None)
+
+# but not at the cost of staged edits
+g,db=make()
+db.events["E1"]=Ev(500,1900)
+g.event=db.events["E1"]; g.event_handle="E1"
+g.model.append(row("Ann","Primary",ap.STATE_NEW,"p1","Person","",-1))
+g.on_events_changed(["E1"])
+check("a staged addition survives the refresh", g.event_handle=="E1")
+check("and the gramplet says the event moved: %r" % g._notice,
+      "changed elsewhere" in g._notice)
+
+# our own apply does not re-enter this
+g,db=make()
+g._applying=True
+g.on_events_changed(["E1"])
+check("the apply transaction's own signals are ignored", g.updates==0)
+
+print("\n[AG] the active event being deleted clears the view")
+g,db=make()
+db.events["E1"]=Ev(500,1900)
+g.event=db.events["E1"]; g.event_handle="E1"
+g._index_years["E1"]=1900
+g.model.append(row("Ann","Primary",ap.STATE_EXISTING,"p1","Person","Primary",0))
+del db.events["E1"]
+g.on_events_deleted(["E1"])
+check("the selection is dropped", g.event is None and g.event_handle is None)
+check("the participant list is emptied (%d)" % len(g.model), len(g.model)==0)
+check("the year map forgets it", "E1" not in g._index_years)
+check("and the view is refreshed (%d)" % g.updates, g.updates==1)
+
+print("\n[AH] a family edit keeps married surnames honest")
+g,db=make()
+db.people["hus"]=Person("x", names=[Name("Ernest","Reyman")], families=["f1"])
+db.people["wife"]=Person("x", names=[Name("Louisa","Heitt")], families=["f1"])
+db.families["f1"]=Family(father="hus", mother="wife")
+g.build_people_cache(); drain(g)
+check("she is searchable by his surname: %r" % g.people_labels["wife"][0],
+      "m. Reyman" in g.people_labels["wife"][0])
+check("the family's wife was remembered", g._index_mothers.get("f1")=="wife")
+# the husband is deleted: Gramps commits the family, never the wife, so no
+# person-update ever names her
+del db.people["hus"]
+db.families["f1"]=Family(father=None, mother="wife")
+db.people["wife"]=Person("x", names=[Name("Louisa","Heitt")], families=["f1"])
+g.on_families_changed(["f1"])
+check("the stale married surname is gone: %r" % g.people_labels["wife"][0],
+      "m. Reyman" not in g.people_labels["wife"][0])
+check("and 'Louisa Reyman' no longer finds her",
+      not any(h=="wife" for _l,h,_s in g._ranked_matches("Louisa Reyman")))
+check("but her own name still does",
+      any(h=="wife" for _l,h,_s in g._ranked_matches("Louisa Heitt")))
+
+# a family deleted outright: the wife can only be found through the old map
+g,db=make()
+db.people["hus"]=Person("x", names=[Name("Ernest","Reyman")], families=["f1"])
+db.people["wife"]=Person("x", names=[Name("Louisa","Heitt")], families=["f1"])
+db.families["f1"]=Family(father="hus", mother="wife")
+g.build_people_cache(); drain(g)
+del db.families["f1"]
+db.people["wife"]=Person("x", names=[Name("Louisa","Heitt")], families=[])
+g.on_families_changed(["f1"])
+check("a deleted family drops her married surname too: %r"
+      % g.people_labels["wife"][0],
+      "m. Reyman" not in g.people_labels["wife"][0])
+
+print("\n[AI] a bulk rebuild reindexes the tree, once")
+g,db=make()
+db.people["p1"]=Person("x", names=[Name("Ann","Lee")])
+g.build_people_cache(); drain(g)
+db.people["p2"]=Person("x", names=[Name("Imported","Person")])
+# an importer disables the signals and only calls request_rebuild(), which
+# fires person-, family- and event-rebuild one after another
+g.on_tree_rebuilt(); g.on_tree_rebuilt(); g.on_tree_rebuilt()
+check("the three signals coalesced into one pending rebuild",
+      g._rebuild_id != 0)
+sid=g._rebuild_id
+run_idle(sid)
+drain(g)
+check("the imported person is searchable (%d indexed)" % len(g.people_labels),
+      "p2" in g.people_labels)
+check("the rebuild source was cleared", g._rebuild_id==0)
 
 print("\n[AB] a change that lands during the index build is not clobbered")
 # The raw build walks a snapshot of the table taken at build_people_cache time.
