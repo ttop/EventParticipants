@@ -134,6 +134,7 @@ class AddParticipants(Gramplet):
         self._matches = []          # ranked (label, handle) for the typed text
         self._index_id = 0          # idle source building the name index
         self._index_iter = None
+        self._index_touched = set() # changed since the snapshot, build skips them
         self._index_raw = False     # reading raw data rather than objects
         self._index_years = {}      # event handle -> year, for labels
         self._index_spouses = {}    # person handle -> spouse surnames
@@ -279,18 +280,94 @@ class AddParticipants(Gramplet):
         if handles is None:
             self.build_people_cache()
             return
+        removed_set = set(handles) if removed else set()
+        # Read each touched person once; the spouse lookups below reuse it, so
+        # a person with no families still costs a single read, as before.
+        people = {}
         for handle in handles:
-            self.people_labels.pop(handle, None)
-            if not removed:
+            if handle not in removed_set:
+                people[handle] = self._get_person(handle)
+        # Rebuild the labels of the touched people plus any spouse whose
+        # married-surname set depends on one of them: a new or renamed husband
+        # changes the name his wives are searchable by, and a new wife gains
+        # the surname she married into.
+        to_cache = set(people)
+        to_cache.update(removed_set)
+        for handle, person in people.items():
+            if person is not None:
+                to_cache.update(self._spouse_dependents(handle, person))
+        # Keep the married-surname map in step before the labels are rebuilt,
+        # since both the label and the search text read from it.
+        for handle in to_cache:
+            if handle in removed_set:
+                self._index_spouses.pop(handle, None)
+                continue
+            person = people.get(handle)
+            if person is None:
                 person = self._get_person(handle)
-                if person is not None:
-                    self.people_labels[handle] = self._person_entry(person)
+            if person is not None:
+                self._index_spouses[handle] = self._spouse_surnames_for(
+                    handle, person)
+        for handle in to_cache:
+            self.people_labels.pop(handle, None)
+            if handle in removed_set:
+                continue
+            person = people.get(handle)
+            if person is None:
+                person = self._get_person(handle)
+            if person is not None:
+                self.people_labels[handle] = self._person_entry(person)
         if self._index_id:
             # A build is in flight; it publishes the sorted list when it
             # finishes, so skip the expensive re-sort but keep the change -
             # iter_people() may already be past this person.
+            #
+            # The raw build walks a snapshot of the table taken before these
+            # changes, so mark the handles it must not clobber: an add or
+            # update is already reflected above, and a delete must stay gone.
+            self._index_touched.update(to_cache)
             return
         self._sort_people_cache()
+
+    @staticmethod
+    def _primary_surname(person):
+        if person is None:
+            return ""
+        primary = person.get_primary_name()
+        return primary.get_surname() if primary else ""
+
+    def _spouse_surnames_for(self, handle, person):
+        """Surnames `person` is known by through marriage, read live from her
+        families: for each family where she is the wife, the husband's
+        surname unless it is already her own. Mirrors _build_spouse_map for a
+        single person, so someone added or renamed mid-session is searchable
+        by the name she married into without a full rebuild."""
+        own = self._primary_surname(person)
+        result = set()
+        for fam_handle in person.family_list:
+            family = self._get_family(fam_handle)
+            if family is None or family.get_mother_handle() != handle:
+                continue
+            father = family.get_father_handle()
+            if not father:
+                continue
+            surname = self._primary_surname(self._get_person(father))
+            if surname and surname != own:
+                result.add(surname)
+        return sorted(result)
+
+    def _spouse_dependents(self, handle, person):
+        """Spouses whose surname set includes `person`'s - her husbands' wives
+        take his surname, so they must be re-cached when a husband is added or
+        renamed; a wife's own set does not depend on anyone else's."""
+        wives = set()
+        for fam_handle in person.family_list:
+            family = self._get_family(fam_handle)
+            if family is not None and family.get_father_handle() == handle:
+                mother = family.get_mother_handle()
+                if mother:
+                    wives.add(mother)
+        return wives
 
     # Gramps raises HandleError for a dangling handle rather than returning
     # None, so every lookup needs a guard: one broken reference anywhere in
@@ -326,6 +403,7 @@ class AddParticipants(Gramplet):
         db = self.dbstate.db
         self.people_labels = {}
         self._index_lifespan = {}
+        self._index_touched = set()
         self._sort_people_cache()
         if db is None or not db.is_open():
             self._show_index_progress(done=True)
@@ -387,7 +465,12 @@ class AddParticipants(Gramplet):
         absorbed = 0
         for item in self._index_iter:
             if self._index_raw:
-                self.people_labels[item["handle"]] = self._raw_person_entry(item)
+                # A concurrent add/update/delete owns this row now; the
+                # pre-captured snapshot is stale for it, so leave it alone
+                # rather than clobbering the fresher value (or re-adding a
+                # person who was deleted).
+                if item["handle"] not in self._index_touched:
+                    self.people_labels[item["handle"]] = self._raw_person_entry(item)
             else:
                 person = self._get_person(item)
                 if person is not None:

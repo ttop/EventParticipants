@@ -158,10 +158,16 @@ class _Date:
 class Ev:
     def __init__(self,s,year=0): self._s=s; self._y=year
     def get_date_object(self): return _Date(self._s,self._y)
+class Family:
+    def __init__(self,father=None,mother=None):
+        self._father=father; self._mother=mother
+    def get_father_handle(self): return self._father
+    def get_mother_handle(self): return self._mother
 class Person:
-    def __init__(self,name,b=None,d=None,refs=None,names=None):
+    def __init__(self,name,b=None,d=None,refs=None,names=None,families=None):
         self.name=name; self._b=b; self._d=d; self.refs=refs or []
         self._names=names; self.handle=None
+        self.family_list=families or []
     def get_primary_name(self):
         return self._names[0] if self._names else Name(raw=self.name)
     def get_alternate_names(self):
@@ -766,6 +772,101 @@ g.build_people_cache(); drain(g)
 lab=g.people_labels["w"][0]
 check("surname, alias and marriage all shown: %r" % lab,
       "Smith" in lab and "aka Janie" in lab and "m. Brown" in lab)
+
+print("\n[AB] a change that lands during the index build is not clobbered")
+# The raw build walks a snapshot of the table taken at build_people_cache time.
+# A person whose name changed after that snapshot must keep the fresh name
+# rather than being written back from the stale copy; a deleted person must
+# stay deleted instead of being resurrected by the snapshot.
+g,db=make()
+db.people["p1"]=Person("x", names=[Name("Old","Name")])
+g.build_people_cache()                    # snapshot taken (p1 = Old); build not yet run
+db.people["p1"]=Person("x", names=[Name("New","Name")])
+g.on_people_changed(["p1"])               # person-update arrives mid-build
+drain(g)
+check("a rename mid-build keeps the fresh name: %r" % g.people_labels["p1"][0],
+      "New" in g.people_labels["p1"][0])
+check("and the stale name is gone: %r" % g.people_labels["p1"][0],
+      "Old" not in g.people_labels["p1"][0])
+
+g,db=make()
+db.people["p1"]=Person("x", names=[Name("Ghost","Name")])
+g.build_people_cache()
+del db.people["p1"]                       # the person is removed
+g.on_people_deleted(["p1"])               # person-delete arrives mid-build
+drain(g)
+check("a deletion mid-build stays deleted",
+      "p1" not in g.people_labels)
+check("...and is out of the searchable index",
+      not any(h=="p1" for _l,h,_s in g.people_cache))
+
+# the ordinary (post-build) recache still works, unaffected by the guard
+g,db=make()
+db.people["p1"]=Person("x", names=[Name("Old","Name")])
+g.build_people_cache(); drain(g)
+db.people["p1"]=Person("x", names=[Name("New","Name")])
+g.on_people_changed(["p1"])
+check("a rename after the build is applied: %r" % g.people_labels["p1"][0],
+      "New" in g.people_labels["p1"][0])
+
+print("\n[AC] a married surname is picked up when the person arrives mid-session")
+# The married name lives on the family, not the person. A wife who already
+# existed is handled by the full build; the gap was a person added (or renamed)
+# after the build, whose surname she married into had not yet been learned.
+
+def hits(g, typed):
+    return [label for label, _h, _s in g._ranked_matches(typed)]
+
+# (a) a new wife: her husband's surname becomes searchable without a rebuild
+g,db=make()
+db.people["hus"]=Person("x", names=[Name("Ernest","Reyman")])
+g.build_people_cache(); drain(g)
+db.families["f1"]=Family(father="hus", mother="wife")
+db.people["wife"]=Person("x", names=[Name("Louisa","Heitt"), ],
+                          families=["f1"])
+db.people["hus"]=Person("x", names=[Name("Ernest","Reyman")],
+                         families=["f1"])
+g.on_people_changed(["wife"])
+check("her label now carries the married surname: %r" % g.people_labels["wife"][0],
+      "m. Reyman" in g.people_labels["wife"][0])
+check("'Louisa Reyman' finds her: %r" % hits(g, "Louisa Reyman"),
+      any("Heitt" in m for m in hits(g, "Louisa Reyman")))
+check("'Louisa Heitt' still finds her",
+      any("Heitt" in m for m in hits(g, "Louisa Heitt")))
+
+# (b) a new husband: his existing wife becomes searchable by his surname
+g,db=make()
+db.people["wife"]=Person("x", names=[Name("Louisa","Heitt")])
+g.build_people_cache(); drain(g)
+check("she has no married surname yet", "m. " not in g.people_labels["wife"][0])
+db.families["f1"]=Family(father="hus", mother="wife")
+db.people["hus"]=Person("x", names=[Name("Ernest","Reyman")],
+                         families=["f1"])
+db.people["wife"]=Person("x", names=[Name("Louisa","Heitt")],
+                          families=["f1"])
+g.on_people_changed(["hus"])
+check("her label now carries his surname: %r" % g.people_labels["wife"][0],
+      "m. Reyman" in g.people_labels["wife"][0])
+check("'Louisa Reyman' finds her: %r" % hits(g, "Louisa Reyman"),
+      any("Heitt" in m for m in hits(g, "Louisa Reyman")))
+check("he himself is NOT findable by her maiden name",
+      not any("Heitt" in m for m in hits(g, "Ernest Heitt")))
+
+# (c) a rename of an existing wife's surname still stays one-directional
+g,db=make()
+db.people["hus"]=Person("x", names=[Name("Ernest","Reyman")],
+                         families=["f1"])
+db.people["wife"]=Person("x", names=[Name("Louisa","Heitt")],
+                          families=["f1"])
+db.families["f1"]=Family(father="hus", mother="wife")
+g.build_people_cache(); drain(g)
+db.people["hus"]=Person("x", names=[Name("Ernest","Newname")],
+                         families=["f1"])
+g.on_people_changed(["hus"])
+check("the wife follows the rename: %r" % g.people_labels["wife"][0],
+      "m. Newname" in g.people_labels["wife"][0])
+check("...and the old surname is gone: %r" % g.people_labels["wife"][0],
+      "Reyman" not in g.people_labels["wife"][0])
 
 print("\n" + ("ALL PASSED" if not fails else "FAILURES: %s" % fails))
 sys.exit(1 if fails else 0)
