@@ -32,7 +32,7 @@ from xml.sax.saxutils import escape as xml_escape
 from gi.repository import GLib, Gtk, Pango
 
 from gramps.gen.plug import Gramplet
-from gramps.gen.lib import Date, EventRef, EventRoleType
+from gramps.gen.lib import Date, EventRef, EventRoleType, EventType
 from gramps.gen.db import DbTxn
 from gramps.gen.display.name import displayer as name_displayer
 from gramps.gen.datehandler import get_date
@@ -118,6 +118,30 @@ def _raw_surname(name_data):
         totalsurn = _("%(first)s %(second)s") % {"first": totalsurn,
                                                  "second": fsurn}
     return totalsurn.strip()
+
+
+def _fallback_type_values():
+    """Event type codes that stand in for a missing birth or death.
+
+    Asked of EventType rather than listed out, so the raw path cannot drift
+    from the is_birth_fallback()/is_death_fallback() predicates
+    (gen/lib/eventtype.py:327) the object path uses. These are the same
+    substitutes gen/utils/db.py:53 accepts.
+    """
+    births, deaths = set(), set()
+    try:
+        for value in EventType().get_map():
+            probe = EventType(value)
+            if probe.is_birth_fallback():
+                births.add(value)
+            if probe.is_death_fallback():
+                deaths.add(value)
+    except Exception:
+        LOG.debug("could not enumerate the event fallback types", exc_info=True)
+    return frozenset(births), frozenset(deaths)
+
+
+BIRTH_FALLBACKS, DEATH_FALLBACKS = _fallback_type_values()
 
 
 def _gregorian_year(date):
@@ -482,8 +506,10 @@ class AddParticipants(Gramplet):
         # Person or Event is ever constructed.
         self._index_raw = True
         self._index_years = {}
+        self._index_fallbacks = {}
         try:
-            self._index_years = self._build_year_map(db)
+            self._index_years, self._index_fallbacks = \
+                self._build_event_maps(db)
             with db.get_person_cursor() as cursor:
                 rows = [data for _handle, data in cursor]
             self._index_spouses = self._build_spouse_map(
@@ -501,6 +527,7 @@ class AddParticipants(Gramplet):
                       exc_info=True)
             self._index_raw = False
             self._index_years = {}
+            self._index_fallbacks = {}
             try:
                 handles = list(db.get_person_handles())
             except Exception:
@@ -600,15 +627,25 @@ class AddParticipants(Gramplet):
         except Exception:
             LOG.debug("could not index person %s", handle, exc_info=True)
 
-    def _build_year_map(self, db):
-        """Event handle -> Gregorian year, for every dated event, in one query."""
+    def _build_event_maps(self, db):
+        """(handle -> Gregorian year, handle -> fallback type) in one query.
+
+        The second map holds only the types that can stand in for a missing
+        birth or death, which is the only reason the raw path needs an event
+        type at all.
+        """
         years = {}
+        fallbacks = {}
         with db.get_event_cursor() as cursor:
             for _handle, data in cursor:
+                handle = data["handle"]
                 year = _raw_year(data["date"])
                 if year:
-                    years[data["handle"]] = year
-        return years
+                    years[handle] = year
+                value = data["type"]["value"]
+                if value in BIRTH_FALLBACKS or value in DEATH_FALLBACKS:
+                    fallbacks[handle] = value
+        return years, fallbacks
 
     def _build_spouse_map(self, db, surname_by_handle):
         """Person handle -> surnames they married into.
@@ -689,15 +726,40 @@ class AddParticipants(Gramplet):
         return label
 
     def _raw_person_years(self, data):
-        """(birth year, death year) from stored data, via the year map."""
+        """(birth year, death year) from stored data, via the year map.
+
+        Plenty of people have no birth event at all, only a christening, and
+        no death event, only a burial. Reading nothing but
+        birth_ref_index/death_ref_index left them with no years in the label
+        and nothing for _alive_at() to exclude them by - a filter that fires
+        on more people, not fewer, which is the point of it.
+        """
         refs = data["event_ref_list"]
-        years = []
-        for key in ("birth_ref_index", "death_ref_index"):
+        years = [0, 0]
+        found = [False, False]
+        for slot, key in enumerate(("birth_ref_index", "death_ref_index")):
             index = data[key]
-            year = 0
             if index is not None and 0 <= index < len(refs):
-                year = self._index_years.get(refs[index]["ref"], 0)
-            years.append(year)
+                years[slot] = self._index_years.get(refs[index]["ref"], 0)
+                found[slot] = True
+        if not all(found):
+            for ref in refs:
+                if all(found):
+                    break
+                if ref["role"]["value"] != EventRoleType.PRIMARY:
+                    continue
+                value = self._index_fallbacks.get(ref["ref"])
+                if value is None:
+                    continue
+                # A stillbirth stands in for both, so neither test excludes
+                # the other - the same as get_birth_or_fallback() and
+                # get_death_or_fallback() run independently.
+                if not found[0] and value in BIRTH_FALLBACKS:
+                    years[0] = self._index_years.get(ref["ref"], 0)
+                    found[0] = True
+                if not found[1] and value in DEATH_FALLBACKS:
+                    years[1] = self._index_years.get(ref["ref"], 0)
+                    found[1] = True
         return tuple(years)
 
     def _raw_person_entry(self, data):
@@ -790,16 +852,41 @@ class AddParticipants(Gramplet):
         parts.extend(self._index_spouses.get(person.get_handle(), ()))
         return _fold(" ".join(part for part in parts if part))
 
+    def _ref_year(self, ref):
+        """The Gregorian year of the event a reference points at, or 0."""
+        event = self._get_event(ref.ref)
+        if event is None:
+            return 0
+        return _gregorian_year(event.get_date_object())
+
     def _person_years(self, person):
-        """(birth year, death year) in the Gregorian calendar, 0 for unknown."""
-        years = []
-        for ref in (person.get_birth_ref(), person.get_death_ref()):
-            year = 0
+        """(birth year, death year) in the Gregorian calendar, 0 for unknown.
+
+        The object-path twin of _raw_person_years: a christening stands in
+        for a missing birth and a burial for a missing death, the same
+        substitutes gen/utils/db.py:53 accepts.
+        """
+        years = [0, 0]
+        found = [False, False]
+        for slot, ref in enumerate((person.get_birth_ref(),
+                                    person.get_death_ref())):
             if ref:
+                years[slot] = self._ref_year(ref)
+                found[slot] = True
+        if not all(found):
+            for ref in person.get_primary_event_ref_list():
+                if all(found):
+                    break
                 event = self._get_event(ref.ref)
-                if event is not None:
-                    year = _gregorian_year(event.get_date_object())
-            years.append(year)
+                if event is None:
+                    continue
+                etype = event.get_type()
+                if not found[0] and etype.is_birth_fallback():
+                    years[0] = _gregorian_year(event.get_date_object())
+                    found[0] = True
+                if not found[1] and etype.is_death_fallback():
+                    years[1] = _gregorian_year(event.get_date_object())
+                    found[1] = True
         return tuple(years)
 
     def _person_entry(self, person):

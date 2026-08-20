@@ -88,15 +88,43 @@ def _mod(n,**a):
     m=types.ModuleType(n); m.__dict__.update(a); sys.modules[n]=m; return m
 
 class EventRoleType:
+    """Mirrors GrampsType's string handling (gen/lib/grampstype.py:203): a
+    known name maps to its code, anything else becomes a CUSTOM role that
+    keeps the string - and a CUSTOM role is not primary."""
     UNKNOWN=-1; CUSTOM=0; PRIMARY=1; CELEBRANT=3; WITNESS=7; FAMILY=8
     _NAMES={-1:"Unknown",0:"Custom",1:"Primary",3:"Celebrant",7:"Witness",8:"Family"}
-    def __init__(self,v=None): self.v=v
+    _VALUES={n:v for v,n in _NAMES.items()}
+    def __init__(self,v=None):
+        self.s=""
+        if isinstance(v,str):
+            self.v=self._VALUES.get(v,self.CUSTOM)
+            if self.v==self.CUSTOM: self.s=v
+        else:
+            self.v=self.UNKNOWN if v is None else v
     def __str__(self):
-        if isinstance(self.v,str): return self.v
+        if self.v==self.CUSTOM and self.s: return self.s
         return self._NAMES.get(self.v,"Unknown")
     def __eq__(self,o): return str(self)==str(o)
     def is_primary(self): return self.v==self.PRIMARY
+    def is_custom(self): return self.v==self.CUSTOM
     def get_standard_names(self): return ["Primary","Witness","Unknown"]
+
+class EventType:
+    """Only the codes and the two fallback predicates the gramplet reads."""
+    MARRIAGE=1; BIRTH=12; DEATH=13; BAPTISM=15; BURIAL=19; CAUSE_DEATH=20
+    CHRISTEN=22; CREMATION=24; PROBATE=39; STILLBIRTH=45
+    _NAMES={1:"Marriage",12:"Birth",13:"Death",15:"Baptism",19:"Burial",
+            20:"Cause Of Death",22:"Christening",24:"Cremation",
+            39:"Probate",45:"Stillbirth"}
+    def __init__(self,v=None): self.v=self.BIRTH if v is None else v
+    def __str__(self): return self._NAMES.get(self.v,"Unknown")
+    def get_map(self): return self._NAMES
+    def is_birth_fallback(self):
+        return self.v in (self.STILLBIRTH,self.BAPTISM,self.CHRISTEN)
+    def is_death_fallback(self):
+        return self.v in (self.STILLBIRTH,self.BURIAL,self.CREMATION,
+                          self.CAUSE_DEATH,self.PROBATE)
+
 class EventRef:
     def __init__(self): self.ref=None; self.role=None
     def set_reference_handle(self,h): self.ref=h
@@ -147,7 +175,7 @@ class DbTxn:
 _mod("gramps"); _mod("gramps.gen")
 _mod("gramps.gen.plug", Gramplet=type("Gramplet",(),{}))
 _mod("gramps.gen.lib", Date=Date, EventRef=EventRef,
-     EventRoleType=EventRoleType)
+     EventRoleType=EventRoleType, EventType=EventType)
 _mod("gramps.gen.db", DbTxn=DbTxn)
 def _format_surnames(parts):
     """SurnameBase.get_surname() over (surname, prefix, connector) triples.
@@ -207,11 +235,17 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import addparticipants as ap
 
 class Ref:
-    def __init__(self,ref,role=None): self.ref=ref; self.role=role
+    """An EventRef. A reference defaults to Primary, which is what a birth,
+    death, christening or burial reference normally is."""
+    def __init__(self,ref,role="Primary"): self.ref=ref; self.role=role
     def set_role(self,r): self.role=r
+    def get_role(self):
+        return self.role if isinstance(self.role,EventRoleType) \
+            else EventRoleType(self.role)
 class Ev:
-    def __init__(self,s,year=0,calendar=0):
-        self._s=s; self._y=year; self._c=calendar
+    def __init__(self,s,year=0,calendar=0,etype=EventType.BIRTH):
+        self._s=s; self._y=year; self._c=calendar; self._t=etype
+    def get_type(self): return EventType(self._t)
     def get_date_object(self):
         date=Date()
         date.set(calendar=self._c, value=(0,0,self._y,False))
@@ -235,6 +269,8 @@ class Person:
     def get_birth_ref(self): return Ref(self._b) if self._b else None
     def get_death_ref(self): return Ref(self._d) if self._d else None
     def get_event_ref_list(self): return self.refs
+    def get_primary_event_ref_list(self):
+        return [r for r in self.refs if r.get_role().is_primary()]
     def set_event_ref_list(self,r): self.refs=r
     def get_handle(self): return self.handle
 def _raw_name(n):
@@ -274,7 +310,9 @@ class FakeDb:
         return {"handle":handle,
                 "primary_name":_raw_name(names[0]),
                 "alternate_names":[_raw_name(n) for n in names[1:]],
-                "event_ref_list":[{"ref":r.ref} for r in p.refs],
+                "event_ref_list":[{"ref":r.ref,
+                                   "role":{"value":r.get_role().v}}
+                                  for r in p.refs],
                 "birth_ref_index":self._ref_index(p,p._b),
                 "death_ref_index":self._ref_index(p,p._d)}
     def get_person_cursor(self):
@@ -289,6 +327,7 @@ class FakeDb:
         for h,e in self.events.items():
             d=e.get_date_object()
             rows.append({"handle":h,
+                         "type":{"value":e._t},
                          "date":{"dateval":list(d.dateval),
                                  "calendar":d.calendar,"quality":d.quality,
                                  "modifier":d.modifier,"text":d.text,
@@ -955,6 +994,56 @@ check("...so a 1926 birth is not ruled out by a 1926 event",
 check("and someone born in 1926 is still offered: %r"
       % [h for _l,h,_s in g._ranked_matches("Chaim Levi")],
       [h for _l,h,_s in g._ranked_matches("Chaim Levi")]==["p1"])
+
+print("\n[AE] a christening stands in for a birth, a burial for a death")
+# Neither event sets birth_ref_index or death_ref_index, so reading only
+# those left these people with no years at all - no label years, and nothing
+# for the alive filter to exclude them by.
+
+def fallback_tree(force_object):
+    g,db=make()
+    db.events["chr"]=Ev(0,1840,etype=EventType.CHRISTEN)
+    db.events["bur"]=Ev(0,1890,etype=EventType.BURIAL)
+    db.people["p1"]=Person("x", names=[Name("Ada","Stone")],
+                           refs=[Ref("chr"),Ref("bur")])
+    if force_object:
+        def boom(): raise RuntimeError("no cursor here")
+        db.get_person_cursor=boom
+    g.build_people_cache(); drain(g)
+    return g
+
+for _force in (False, True):
+    g=fallback_tree(_force); path="object" if _force else "raw"
+    check("%s: took the raw path? %r" % (path, g._index_raw),
+          g._index_raw is not _force)
+    check("%s: both years reach the label: %r" % (path, g.people_labels["p1"][0]),
+          "1840" in g.people_labels["p1"][0]
+          and "1890" in g.people_labels["p1"][0])
+    check("%s: and the lifespan: %r" % (path, g._index_lifespan["p1"]),
+          g._index_lifespan["p1"]==(1840,1890))
+    check("%s: so a 1990 event rules her out" % path,
+          g._alive_at("p1",1990) is False)
+    check("%s: and an 1860 one does not" % path,
+          g._alive_at("p1",1860) is True)
+check("both paths produce the same entry",
+      fallback_tree(False).people_labels["p1"]
+      == fallback_tree(True).people_labels["p1"])
+
+# a witness at someone else's burial has not died
+for _force in (False, True):
+    g,db=make(); path="object" if _force else "raw"
+    db.events["bur"]=Ev(0,1890,etype=EventType.BURIAL)
+    db.people["p1"]=Person("x", names=[Name("Ida","Stone")],
+                           refs=[Ref("bur","Witness")])
+    if _force:
+        def boom(): raise RuntimeError("no cursor here")
+        db.get_person_cursor=boom
+    g.build_people_cache(); drain(g)
+    check("%s: a non-primary role is not a fallback: %r"
+          % (path, g._index_lifespan["p1"]),
+          g._index_lifespan["p1"]==(0,0))
+    check("%s: so she is never ruled out" % path,
+          g._alive_at("p1",1990) is None)
 
 print("\n[AB] a change that lands during the index build is not clobbered")
 # The raw build walks a snapshot of the table taken at build_people_cache time.
