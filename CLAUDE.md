@@ -1,4 +1,4 @@
-# AddParticipants — a Gramps gramplet
+# EventParticipants — a Gramps gramplet
 
 ## What this is
 
@@ -18,28 +18,28 @@ that prompted this project.
 
 ## Files
 
-- `addparticipants.gpr.py` — plugin registration. `navtypes=["Event"]`,
+- `eventparticipants.gpr.py` — plugin registration. `navtypes=["Event"]`,
   `gramps_target_version="6.0"`.
-- `addparticipants.py` — the `AddParticipants(Gramplet)` class, all of it.
+- `eventparticipants.py` — the `EventParticipants(Gramplet)` class, all of it.
 - `LICENSE` — GPL v2. Gramps is GPL v2-or-later and this gramplet subclasses
   `gen.plug.Gramplet` and imports `gen.lib`, `gen.db` and friends, so it is a
   derivative work: distributing it means GPL-compatible terms. Every bundled
   Gramps plugin with code in it carries the same header, as does every
   third-party addon installed here. Keep the per-file headers in step with it.
-- `test_addparticipants.py` — logic tests. Gramps embeds libpython and ships
+- `test_eventparticipants.py` — logic tests. Gramps embeds libpython and ships
   no interpreter, so these stub out Gramps and GTK and cover the plain logic
-  only. `python3 test_addparticipants.py`, no framework needed. They do not
+  only. `python3 test_eventparticipants.py`, no framework needed. They do not
   touch the GTK wiring.
 
 ## Environment
 
 - macOS, Gramps 6.0 (the .app bundle from the DMG)
 - Tree is ~2,400 people
-- **This repo lives in `~/sources/AddParticipants`.** Edit here, never in the
+- **This repo lives in `~/sources/EventParticipants`.** Edit here, never in the
   Gramps directory.
 - Gramps user directory: `~/Library/Application Support/gramps/gramps60/`
 - The two `.py` files are **symlinked** into
-  `~/Library/Application Support/gramps/gramps60/plugins/AddParticipants/`,
+  `~/Library/Application Support/gramps/gramps60/plugins/EventParticipants/`,
   so edits in this repo are live — no copy step. If a new source file is added
   to the addon, symlink it too or Gramps won't see it.
 
@@ -52,7 +52,7 @@ Terminal so tracebacks are visible:
 /Applications/Gramps.app/Contents/MacOS/Gramps 2>&1 | tee /tmp/gramps.log
 ```
 
-Then: Events view → right-click bottombar → Add Participants.
+Then: Events view → right-click bottombar → Event Participants.
 
 Load failures surface in the Plugin Manager (separate dialog from the Addon
 Manager). Registered Plugins / Loaded Plugins tabs; double-click a failed row
@@ -68,7 +68,7 @@ Running in Gramps and used against the real tree: participants list, apply,
 undo, type-ahead search and role editing all exercised. Every Gramps API call
 was also checked against the 6.0 sources in
 `/Applications/Gramps.app/Contents/Resources/lib/python3.13/site-packages/gramps`,
-and `test_addparticipants.py` covers the non-GTK logic.
+and `test_eventparticipants.py` covers the non-GTK logic.
 
 Everything that actually went wrong in use was a *behaviour* problem the source
 reading could not have caught — a blocking index that looked like a broken
@@ -105,6 +105,21 @@ rather than calling the db directly.
 
 ## Design decisions already made
 
+- **The tab is called "Event Participants", not "Participants".** The
+  `Participants` addon (`Addon:ParticipantsGramplet`) is installed here and
+  already owns that tab label. Stock Event gramplets pair a long `name` with a
+  short `gramplet_title` — `Event References` shows as tab `References` —
+  because inside the Events view the prefix is redundant; this one deliberately
+  breaks that convention, since the short form *is* the collision.
+  `grampletpane.add_gramplet()` would not have refused the duplicate, it
+  uniquifies it to "Participants-1" (`grampletpane.py:1459`), so the clash
+  would have been silent.
+  Renamed from `AddParticipants` on 2026-08-20, plugin `id` included. The id is
+  what `Events_eventview_bottombar.ini` stores as `name=` under a section
+  headed by the *title* (`grampletpane.py:88`, `:1258`), so changing either
+  orphans an already-placed gramplet: it has to be re-added from the bottombar
+  right-click menu, or that ini hand-edited while Gramps is shut down.
+
 - New participants default to role **Primary**. Stock Gramps defaults a
   *shared* event to Unknown, and this addon did too until it was used in
   anger: the Events view's Main Participants column only counts references
@@ -133,7 +148,7 @@ rather than calling the db directly.
   "Indexing names..." for the rest of the session, and the sorted cache is
   never published. Keep all exits routed through `_finish_index()`.
 - Labels are still built `INDEX_CHUNK` people per GLib idle turn, and the
-  search box shows "Indexing names..." until it is done. `test_addparticipants.py`
+  search box shows "Indexing names..." until it is done. `test_eventparticipants.py`
   asserts the raw and object paths produce byte-identical labels and search
   text — if you touch either, keep that test honest. The `parity()` helper in
   `[S]` is the place to add a case; `_raw_surname()` mirrors

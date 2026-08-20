@@ -1,5 +1,5 @@
 #
-# Add Participants - a Gramps gramplet
+# Event Participants - a Gramps gramplet
 #
 # Copyright (C) 2026 Todd Wells <todd@wellshub.com>
 #
@@ -16,14 +16,14 @@
 # You should have received a copy of the GNU General Public License along
 # with this program; if not, see <https://www.gnu.org/licenses/>.
 #
-"""Logic tests for the AddParticipants gramplet.
+"""Logic tests for the EventParticipants gramplet.
 
 Gramps embeds libpython and ships no interpreter, so these stub out the
 Gramps and GTK layers and exercise the plain logic: handle guards, the
 apply transaction, the people cache and the completion model. They do not
 test the GTK wiring - that still needs a real Gramps launch.
 
-Run with:  python3 test_addparticipants.py
+Run with:  python3 test_eventparticipants.py
 """
 import os, sys, types
 
@@ -243,7 +243,7 @@ _mod("gramps.gen.const", GRAMPS_LOCALE=type("L",(),{"translation":
      type("T",(),{"gettext":staticmethod(lambda s:s)})()})())
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import addparticipants as ap
+import eventparticipants as ap
 
 class Ref:
     """An EventRef. A reference defaults to Primary, which is what a birth,
@@ -383,7 +383,7 @@ class FakeDb:
         f=self.families[h]; f.handle=h; return f
 
 def make():
-    g=ap.AddParticipants.__new__(ap.AddParticipants)
+    g=ap.EventParticipants.__new__(ap.EventParticipants)
     db=FakeDb()
     g.dbstate=type("S",(),{"db":db})()
     g.uistate=type("U",(),{"push_message":lambda s,d,t:None})()

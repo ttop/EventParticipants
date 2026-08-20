@@ -1,5 +1,5 @@
 #
-# Add Participants - a Gramps gramplet
+# Event Participants - a Gramps gramplet
 #
 # Copyright (C) 2026 Todd Wells <todd@wellshub.com>
 #
@@ -42,7 +42,7 @@ from gramps.gen.const import GRAMPS_LOCALE as glocale
 
 _ = glocale.translation.gettext
 
-LOG = logging.getLogger(".AddParticipants")
+LOG = logging.getLogger(".EventParticipants")
 
 # Columns in the participant model
 COL_NAME = 0
@@ -329,7 +329,7 @@ def _fold_variants(text):
     return keys
 
 
-class AddParticipants(Gramplet):
+class EventParticipants(Gramplet):
     """View and edit every participant of the active event."""
 
     # ------------------------------------------------------------------
@@ -562,7 +562,7 @@ class AddParticipants(Gramplet):
             if batch:
                 self._recache_people(batch, removed=False)
         except Exception:
-            LOG.exception("Add Participants: re-caching a batch failed")
+            LOG.exception("Event Participants: re-caching a batch failed")
         if self._recache_pending:
             return True
         self._recache_id = 0
@@ -989,7 +989,7 @@ class AddParticipants(Gramplet):
             # box sits on "Indexing names..." for the rest of the session and
             # the sorted index is never published. Publish what there is.
             LOG.exception(
-                "Add Participants: indexing stopped early; "
+                "Event Participants: indexing stopped early; "
                 "the name index may be incomplete"
             )
         self._finish_index()
@@ -1492,7 +1492,7 @@ class AddParticipants(Gramplet):
         except Exception:
             # An empty list here reads as "nobody is attached to this event",
             # which is exactly what a broken lookup must not be mistaken for.
-            LOG.exception("Add Participants: could not read the participants "
+            LOG.exception("Event Participants: could not read the participants "
                           "of event %s", ev_handle)
             backlinks = []
 
@@ -2070,7 +2070,7 @@ class AddParticipants(Gramplet):
             # database is untouched. An exception raised from a GTK callback
             # would otherwise reach the user as nothing at all: keep the
             # pending edits on screen and say what went wrong.
-            LOG.exception("Add Participants: applying changes failed")
+            LOG.exception("Event Participants: applying changes failed")
             self._report(_("Could not apply changes: %s") % err)
             return
         finally:
