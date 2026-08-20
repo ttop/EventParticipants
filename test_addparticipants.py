@@ -797,6 +797,14 @@ lab = parity("married", [Name("Louisa","Heitt")],
 check("a surname reached by marriage is annotated the same way: %r" % lab,
       "m. Reyman" in lab)
 
+lab = parity("nick and call",
+             [Name("John Mervyn","Joy",nick="Buster",call="Mervyn"),
+              Name("Jack","Joy",call="Sonny")])
+check("the nickname is shown and marked: %r" % lab, "nicknamed Buster" in lab)
+check("a call name that is not one of the given names is shown: %r" % lab,
+      "called Sonny" in lab)
+check("...but one that is adds no clutter: %r" % lab, "called Mervyn" not in lab)
+
 lab = parity("hebrew calendar", [Name("Chaim","Levi")],
              calendar=Date.CAL_HEBREW, years=(5661,5740))
 check("both readers convert to the Gregorian year: %r" % lab,
@@ -1382,6 +1390,41 @@ g.event_handle="E1"
 g.main()
 check("nothing staged, nothing said: %r" % g.last_status,
       not str(g.last_status or ""))
+
+print("\n[AO] a nickname that finds someone is visible on their row")
+g,db=make()
+db.people["p1"]=Person("x", names=[Name("John Mervyn","Joy",nick="Buster")])
+db.people["p2"]=Person("x", names=[Name("Ann","Lee",call="Nancy")])
+g.build_people_cache(); drain(g)
+check("'Buster' finds him",
+      any(h=="p1" for _l,h,_s in g._ranked_matches("Buster")))
+check("and the label says why: %r" % g.people_labels["p1"][0],
+      "nicknamed Buster" in g.people_labels["p1"][0])
+check("'Nancy' finds her",
+      any(h=="p2" for _l,h,_s in g._ranked_matches("Nancy")))
+check("and the label says why: %r" % g.people_labels["p2"][0],
+      "called Nancy" in g.people_labels["p2"][0])
+check("her own name still leads: %r" % g.people_labels["p2"][0],
+      g.people_labels["p2"][0].startswith("Lee, Ann"))
+
+print("\n[AP] letters that do not decompose, and elided apostrophes")
+g,db=make()
+db.people["p1"]=Person("x", names=[Name("Søren","Kjær")])
+db.people["p2"]=Person("x", names=[Name("Sean","O'Brien")])
+db.people["p3"]=Person("x", names=[Name("Stanisław","Bałka")])
+g.build_people_cache(); drain(g)
+def hit(typed): return [h for _l,h,_s in g._ranked_matches(typed)]
+check("'Soren' finds 'Søren'", "p1" in hit("Soren"))
+check("'Kjaer' finds 'Kjær'", "p1" in hit("Kjaer"))
+check("'Søren' still finds himself", "p1" in hit("Søren"))
+check("'Stanislaw Balka' finds the barred Ls", "p3" in hit("Stanislaw Balka"))
+check("'obrien' finds \"O'Brien\"", "p2" in hit("obrien"))
+check("\"Sean O'Brien\" still finds him", "p2" in hit("Sean O'Brien"))
+check("and so does 'o brien'", "p2" in hit("o brien"))
+check("_fold keeps the split and the elided form: %r" % ap._fold("O'Brien"),
+      ap._fold("O'Brien")=="o brien obrien")
+check("a plain name is untouched: %r" % ap._fold("Doe, Jane"),
+      ap._fold("Doe, Jane")=="doe jane")
 
 print("\n[AB] a change that lands during the index build is not clobbered")
 # The raw build walks a snapshot of the table taken at build_people_cache time.

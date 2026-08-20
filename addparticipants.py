@@ -210,16 +210,48 @@ def _form_keys(forms):
     return frozenset(keys)
 
 
+# Letters whose difference lives in the letter itself rather than in a
+# combining accent, so NFKD leaves them exactly as they are. Without these
+# "Soren" never found "Søren", whatever the docstring promised.
+_FOLD_MAP = str.maketrans({
+    "ø": "o", "Ø": "O",
+    "æ": "ae", "Æ": "AE",
+    "œ": "oe", "Œ": "OE",
+    "ł": "l", "Ł": "L",
+    "đ": "d", "Đ": "D",
+    "ð": "d", "Ð": "D",
+    "þ": "th", "Þ": "TH",
+})
+
+# Apostrophes, in the several shapes a name can carry one.
+_APOSTROPHES = "'‘’ʼ`"
+_WORD_SPLIT = re.compile(r"[^\w%s]+" % re.escape(_APOSTROPHES))
+_APOSTROPHE_SPLIT = re.compile(r"[%s]+" % re.escape(_APOSTROPHES))
+
+
 def _fold(text):
     """Reduce text to lowercase, unaccented, space-separated words.
 
     Both the typed key and the searchable text go through this, so "Muller"
     finds "Müller" and punctuation in the display format stops mattering.
     GTK casefolds the key it hands us but leaves accents in place.
+
+    A word split by an apostrophe is also kept whole, so "O'Brien" answers
+    to "o brien" and to "obrien" alike - splitting alone left the one-word
+    spelling matching nobody.
     """
-    decomposed = unicodedata.normalize("NFKD", text or "")
+    decomposed = unicodedata.normalize("NFKD",
+                                       (text or "").translate(_FOLD_MAP))
     bare = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
-    return " ".join(part for part in re.split(r"[^\w]+", bare.casefold()) if part)
+    words = []
+    for chunk in _WORD_SPLIT.split(bare.casefold()):
+        if not chunk:
+            continue
+        parts = [part for part in _APOSTROPHE_SPLIT.split(chunk) if part]
+        words.extend(parts)
+        if len(parts) > 1:
+            words.append("".join(parts))
+    return " ".join(words)
 
 
 class AddParticipants(Gramplet):
@@ -282,8 +314,12 @@ class AddParticipants(Gramplet):
         self.entry.set_placeholder_text(_("Type a name to add someone..."))
         self.entry.set_completion(completion)
         self.entry.connect("activate", self.on_entry_activate)
-        # Connected after set_completion so GTK's own handler runs first and
-        # then sees the reordered model.
+        # set_completion() installs GTK's own "changed" handler, so it runs
+        # first, against the model as it was - the refill below happens
+        # afterwards. What makes that come out right is the completion's
+        # filter model refiltering once the model changes underneath it,
+        # which is why _match_func has to go on matching every typed word
+        # against the folded search column rather than being simplified away.
         self.entry.connect("changed", self._update_completion)
         vbox.pack_start(self.entry, False, False, 0)
 
@@ -856,15 +892,19 @@ class AddParticipants(Gramplet):
         return {handle: sorted(names) for handle, names in spouses.items()}
 
     def _other_names(self, handle, primary_given, primary_surname,
-                     alt_givens, alt_surnames):
+                     alt_givens, alt_surnames, nicks, calls):
         """Every other name this person answers to, for the label.
 
         Anything here can make the person match, so it has to be visible:
         otherwise searching "Loretta" turns up "Casey, Lura Ruth" with no
         indication of why. Alternate surnames appear as they are, an
-        alternate given name is marked "aka", and a surname reached by
-        marriage is marked "m." - which reads correctly for a husband too,
-        since he is not known by his wife's surname but is married to it.
+        alternate given name is marked "aka", a nickname "nicknamed", a call
+        name "called", and a surname reached by marriage "m." - which reads
+        correctly for a husband too, since he is not known by his wife's
+        surname but is married to it.
+
+        A call name is usually one of the given names already shown, so it
+        only earns a place when it is not.
         """
         others = []
         for surname in alt_surnames:
@@ -873,6 +913,17 @@ class AddParticipants(Gramplet):
         for given in alt_givens:
             if given and given != primary_given:
                 marked = _("aka %s") % given
+                if marked not in others:
+                    others.append(marked)
+        for nick in nicks:
+            if nick:
+                marked = _("nicknamed %s") % nick
+                if marked not in others:
+                    others.append(marked)
+        givens = " ".join([primary_given] + [g for g in alt_givens if g])
+        for call in calls:
+            if call and call not in givens:
+                marked = _("called %s") % call
                 if marked not in others:
                     others.append(marked)
         for surname in self._index_spouses.get(handle, ()):
@@ -947,10 +998,13 @@ class AddParticipants(Gramplet):
         alternates = data["alternate_names"]
         name = name_displayer.raw_display_name(primary)
         primary_surname = _raw_surname(primary)
+        all_names = [primary] + list(alternates)
         others = self._other_names(
             data["handle"], primary["first_name"], primary_surname,
             [alt["first_name"] for alt in alternates],
             [_raw_surname(alt) for alt in alternates],
+            [one["nick"] for one in all_names],
+            [one["call"] for one in all_names],
         )
         return self._decorate(name, others, years)
 
@@ -1008,10 +1062,13 @@ class AddParticipants(Gramplet):
         primary_surname = primary.get_surname() if primary else ""
         primary_given = primary.get_first_name() if primary else ""
         alternates = person.get_alternate_names()
+        all_names = ([primary] if primary else []) + list(alternates)
         others = self._other_names(
             person.get_handle(), primary_given, primary_surname,
             [alt.get_first_name() for alt in alternates],
             [alt.get_surname() for alt in alternates],
+            [one.get_nick_name() for one in all_names],
+            [one.get_call_name() for one in all_names],
         )
         return self._decorate(name, others, years)
 
