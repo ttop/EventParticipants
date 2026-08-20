@@ -213,7 +213,12 @@ rather than calling the db directly.
   deleting or unlinking a husband commits the *family* and never the wife, so
   no `person-update` ever names her and she kept a "m. Surname" she is no
   longer known by (`_build_spouse_map` records each family's wife in
-  `_index_mothers` so a deleted family can still be traced back to her); and
+  `_index_mothers` so a deleted family can still be traced back to her), and
+  because a marriage already on screen otherwise kept the old `Family:` row
+  after a relink or left a deleted one visible until some other refresh; when
+  that row is part of the active event and nothing is staged, it is reloaded
+  at once, and when edits are staged the gramplet says so and leaves the
+  reload to Revert rather than discarding them silently; and
   `person-rebuild`/`family-rebuild`/`event-rebuild`, because importers run
   with signals disabled and announce the result with `request_rebuild()`
   alone (`gen/db/generic.py:2646`), leaving every imported person unsearchable

@@ -1432,6 +1432,23 @@ check("the family reference is untouched (%d)" % len(db.families["f1"].refs),
 check("and the apply says it skipped it: %r" % g.last_status,
       "+0" in str(g.last_status) and "no longer matched" in str(g.last_status))
 
+print("\n[AJ3] an active family row follows family updates and deletes")
+g,db=married_tree()
+db.people["w2"]=Person("x", names=[Name("Jill","Brown")])
+db.families["f1"]=Family(father="h", mother="w2",
+                         refs=[Ref("E1","Family")])
+g.on_families_changed(["f1"])
+check("a relinked family row shows the new spouse: %r" % g.model[0][ap.COL_NAME],
+      "Jill" in g.model[0][ap.COL_NAME] and "Jane" not in g.model[0][ap.COL_NAME])
+check("and the covered set follows the new couple: %r" % (g._completion_excluded,),
+      g._completion_excluded=={"h","w2"})
+
+g,db=married_tree()
+del db.families["f1"]
+g.on_families_changed(["f1"])
+check("a deleted family row vanishes from the active event (%d rows)" % len(g.model),
+      len(g.model)==0)
+
 print("\n[AK] a role typed in the wrong case is snapped to the real one")
 g,db=make()
 g.role_model=_ListStore(str)

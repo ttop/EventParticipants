@@ -681,6 +681,13 @@ class AddParticipants(Gramplet):
             self.build_people_cache()
             return
         wives = set()
+        active_event = self.event_handle
+        listed = {
+            row[COL_HANDLE]
+            for row in self.model
+            if row[COL_KIND] == "Family"
+        }
+        reload_rows = False
         for handle in handles:
             try:
                 # The wife the family used to have, for the case where the
@@ -692,11 +699,17 @@ class AddParticipants(Gramplet):
                 if family is None:
                     # A family that is listed but gone covers nobody now.
                     self._family_spouses.pop(handle, None)
+                    if handle in listed:
+                        reload_rows = True
                     continue
                 mother = family.get_mother_handle()
                 if mother:
                     self._index_mothers[handle] = mother
                     wives.add(mother)
+                if (active_event and not reload_rows
+                        and any(ref.ref == active_event
+                                for ref in family.get_event_ref_list())):
+                    reload_rows = True
                 if handle in self._family_spouses:
                     # A spouse just unlinked stops being covered by this
                     # row, and one just linked starts.
@@ -710,7 +723,17 @@ class AddParticipants(Gramplet):
                 LOG.debug("could not re-read family %s", handle, exc_info=True)
         if wives:
             self._recache_people(sorted(wives), removed=False)
-        self.refresh_completion()
+        if reload_rows and self.event is not None:
+            if any(self.pending_counts()):
+                self._report(_("A family participant changed elsewhere; "
+                               "Revert reloads the list"))
+                self.update_status()
+            else:
+                self.load_participants()
+                self.refresh_completion()
+                self.update_status()
+        else:
+            self.refresh_completion()
 
     def _recache_people(self, handles, removed):
         if handles is None:
