@@ -32,7 +32,8 @@ from xml.sax.saxutils import escape as xml_escape
 from gi.repository import GLib, Gtk, Pango
 
 from gramps.gen.plug import Gramplet
-from gramps.gen.lib import EventRef, EventRoleType
+from gramps.gen.lib import Date, EventRef, EventRoleType, EventType
+from gramps.gen.lib.date import gregorian
 from gramps.gen.db import DbTxn
 from gramps.gen.display.name import displayer as name_displayer
 from gramps.gen.datehandler import get_date
@@ -50,7 +51,7 @@ COL_STATE = 2      # internal token, never shown
 COL_HANDLE = 3
 COL_KIND = 4       # "Person" or "Family"
 COL_ORIG_ROLE = 5
-COL_REFIDX = 6     # index into the object's event_ref_list, -1 for new
+COL_REFNTH = 6     # which of this object's refs to the event, -1 for new
 COL_WEIGHT = 7     # bold for staged additions
 COL_STATE_TEXT = 8  # translated text for the state column
 
@@ -63,6 +64,13 @@ COMP_SEARCH = 2    # folded text the matcher searches, never displayed
 # database reads per person for the birth and death years, so on a few
 # thousand people it must not run in one go on the main loop.
 INDEX_CHUNK = 250
+
+# Above this many people, a re-cache moves onto idle turns instead of running
+# inside the signal handler that asked for it. Correcting the date of a
+# shared event touches every participant, and a census can have hundreds:
+# each costs a person read plus their birth, death and family reads, which is
+# the query-per-person freeze the raw index was written to get away from.
+RECACHE_CHUNK = 50
 
 # Most rows the type-ahead will offer at once. GtkEntryCompletion shows model
 # rows in model order, so the model is rebuilt per keystroke, best first.
@@ -79,6 +87,12 @@ COMPLETION_LIMIT = 40
 # unknown is never held against anyone.
 MAX_LIFESPAN = 100   # years
 DEATH_GRACE = 2      # burials, probate and the like follow a death
+# A christening follows a birth the same way round, so when the birth year
+# is really a christening year it is a lower bound that sits slightly too
+# late: without this, someone christened in 1842 is ruled out of an 1841
+# census. Adult baptism is not covered by two years and never will be - the
+# stock way of attaching a person to an event is there for that.
+BIRTH_GRACE = 2      # christenings and baptisms follow a birth
 
 STATE_EXISTING = ""
 STATE_NEW = "new"
@@ -94,16 +108,180 @@ STATE_TEXT = {
 
 
 def _raw_surname(name_data):
-    """Approximate SurnameBase.get_surname() from raw data."""
-    parts = []
+    """SurnameBase.get_surname() from raw data.
+
+    A faithful mirror of gen/lib/surnamebase.py:180, joiner for joiner: the
+    raw and object index paths have to produce byte-identical names, and the
+    married-surname map compares a husband's surname read one way against a
+    wife's read the other. Dropping the connector, or skipping a surname part
+    that has only a prefix, made the two disagree about the same person.
+    """
+    totalsurn = ""
     for surname in name_data["surname_list"]:
-        value = surname["surname"]
+        fsurn = surname["surname"]
         prefix = surname["prefix"]
-        if prefix and value:
-            value = "%s %s" % (prefix, value)
-        if value:
-            parts.append(value)
-    return " ".join(parts)
+        if prefix:
+            fsurn = _("%(first)s %(second)s") % {"first": prefix,
+                                                 "second": fsurn}
+        fsurn = fsurn.strip()
+        connector = surname["connector"]
+        if connector:
+            fsurn = _("%(first)s %(second)s") % {"first": fsurn,
+                                                 "second": connector}
+        fsurn = fsurn.strip()
+        totalsurn = _("%(first)s %(second)s") % {"first": totalsurn,
+                                                 "second": fsurn}
+    return totalsurn.strip()
+
+
+def _is_staged(entry):
+    """Does this snapshotted model row actually ask for a change?
+
+    An existing participant whose role was never touched is not a pending
+    change, and counting one as skipped overstated how much of an apply had
+    failed to land.
+    """
+    role, orig_role, state, _nth = entry
+    return state != STATE_EXISTING or role != orig_role
+
+
+def _fallback_type_values():
+    """Event type codes that stand in for a missing birth or death.
+
+    Asked of EventType rather than listed out, so the raw path cannot drift
+    from the is_birth_fallback()/is_death_fallback() predicates
+    (gen/lib/eventtype.py:327) the object path uses. These are the same
+    substitutes gen/utils/db.py:53 accepts.
+    """
+    births, deaths = set(), set()
+    try:
+        for value in EventType().get_map():
+            probe = EventType(value)
+            if probe.is_birth_fallback():
+                births.add(value)
+            if probe.is_death_fallback():
+                deaths.add(value)
+    except Exception:
+        LOG.debug("could not enumerate the event fallback types", exc_info=True)
+    return frozenset(births), frozenset(deaths)
+
+
+BIRTH_FALLBACKS, DEATH_FALLBACKS = _fallback_type_values()
+
+
+def _gregorian_year(date):
+    """The year of a Date in the Gregorian calendar, or 0.
+
+    Date.get_year() answers in the date's *own* calendar, so one event
+    entered in the Hebrew calendar reads as year 5686: nonsense in a label,
+    and on its own enough for _alive_at() to rule out everybody in the tree.
+    The conversion is Gramps' own gregorian() (gen/lib/date.py:2133), which
+    leaves the original object alone.
+    """
+    if date is None:
+        return 0
+    try:
+        return gregorian(date).get_year() or 0
+    except Exception:
+        LOG.debug("could not convert a date to the Gregorian calendar",
+                  exc_info=True)
+        return date.get_year() or 0
+
+
+def _raw_year(date_data):
+    """The Gregorian year of a stored date, or 0.
+
+    dateval carries the year in whatever calendar the date was entered in,
+    so a non-Gregorian one is rebuilt just far enough to convert it. Nearly
+    every date is Gregorian and constructs nothing.
+    """
+    if not date_data:
+        return 0
+    dateval = date_data["dateval"]
+    if not dateval or len(dateval) <= Date._POS_YR:
+        return 0
+    year = dateval[Date._POS_YR] or 0
+    calendar = date_data["calendar"]
+    if not year or not calendar:
+        return year
+    try:
+        date = Date()
+        date.set(quality=date_data["quality"],
+                 modifier=date_data["modifier"],
+                 calendar=calendar,
+                 value=tuple(dateval),
+                 text=date_data["text"],
+                 newyear=date_data["newyear"])
+        return _gregorian_year(date)
+    except Exception:
+        LOG.debug("could not convert a stored date to the Gregorian calendar",
+                  exc_info=True)
+        return year
+
+
+def _form_keys(forms):
+    """Whole-name forms reduced to word sets, for the Enter-key test.
+
+    A set of words rather than a string: the display format is "Surname,
+    Given" and nobody types a name that way round.
+
+    Every spelling of a form gets a set of its own. _fold indexes an
+    apostrophe word both split and elided, so a single set for "O'Brien,
+    Sean" holds "o", "brien" *and* "obrien" - and every way of typing that
+    name is then a strict subset of it and never an exact match.
+    """
+    keys = set()
+    for form in forms:
+        keys.update(_fold_variants(form))
+    return frozenset(keys)
+
+
+# Letters whose difference lives in the letter itself rather than in a
+# combining accent, so NFKD leaves them exactly as they are. Without these
+# "Soren" never found "Søren", whatever the docstring promised.
+#
+# Applied *after* NFKD, never before: "ǿ" (U+01FF) decomposes to "ø" plus a
+# combining acute, so translating first left the stroked letter behind in the
+# index and "Sǿren" folded to "søren" - findable by no plain spelling at all.
+_FOLD_MAP = str.maketrans({
+    "ø": "o", "Ø": "O",
+    "æ": "ae", "Æ": "AE",
+    "œ": "oe", "Œ": "OE",
+    "ł": "l", "Ł": "L",
+    "đ": "d", "Đ": "D",
+    "ð": "d", "Ð": "D",
+    "þ": "th", "Þ": "TH",
+})
+
+# Apostrophes, in the several shapes a name can carry one.
+_APOSTROPHES = "'‘’ʼ`"
+_WORD_SPLIT = re.compile(r"[^\w%s]+" % re.escape(_APOSTROPHES))
+_APOSTROPHE_SPLIT = re.compile(r"[%s]+" % re.escape(_APOSTROPHES))
+
+
+# A name with this many apostrophe words has more spellings than anyone will
+# type; past it _fold_variants stops enumerating and leans on the full set.
+MAX_FORM_VARIANTS = 16
+
+
+def _fold_words(text):
+    """The folded words of `text`, grouped one list per source word.
+
+    A plain word contributes one spelling; a word carrying an apostrophe
+    contributes its parts, which _fold and _fold_variants then recombine in
+    their own ways.
+    """
+    decomposed = unicodedata.normalize("NFKD", text or "")
+    bare = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+    bare = bare.translate(_FOLD_MAP)
+    groups = []
+    for chunk in _WORD_SPLIT.split(bare.casefold()):
+        if not chunk:
+            continue
+        parts = [part for part in _APOSTROPHE_SPLIT.split(chunk) if part]
+        if parts:
+            groups.append(parts)
+    return groups
 
 
 def _fold(text):
@@ -112,10 +290,43 @@ def _fold(text):
     Both the typed key and the searchable text go through this, so "Muller"
     finds "Müller" and punctuation in the display format stops mattering.
     GTK casefolds the key it hands us but leaves accents in place.
+
+    A word split by an apostrophe is also kept whole, so "O'Brien" answers
+    to "o brien" and to "obrien" alike - splitting alone left the one-word
+    spelling matching nobody.
     """
-    decomposed = unicodedata.normalize("NFKD", text or "")
-    bare = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
-    return " ".join(part for part in re.split(r"[^\w]+", bare.casefold()) if part)
+    words = []
+    for parts in _fold_words(text):
+        words.extend(parts)
+        if len(parts) > 1:
+            words.append("".join(parts))
+    return " ".join(words)
+
+
+def _fold_variants(text):
+    """Every word set someone could reasonably type for this one name.
+
+    An apostrophe word can be typed three ways - "O'Brien", "O Brien",
+    "OBrien" - which fold to different word sets. Each is enumerated so the
+    Enter key's exact test can match on any of them.
+    """
+    variants = [frozenset()]
+    for parts in _fold_words(text):
+        spellings = [frozenset(parts)]
+        if len(parts) > 1:
+            spellings.append(frozenset(["".join(parts)]))
+        variants = [variant | spelling
+                    for variant in variants
+                    for spelling in spellings]
+        if len(variants) > MAX_FORM_VARIANTS:
+            variants = variants[:MAX_FORM_VARIANTS]
+    keys = {variant for variant in variants if variant}
+    # However many were enumerated, the spelling _fold itself produces has
+    # to be one of them.
+    everything = frozenset(_fold(text).split())
+    if everything:
+        keys.add(everything)
+    return keys
 
 
 class AddParticipants(Gramplet):
@@ -134,11 +345,22 @@ class AddParticipants(Gramplet):
         self._matches = []          # ranked (label, handle) for the typed text
         self._index_id = 0          # idle source building the name index
         self._index_iter = None
+        self._index_touched = set() # changed since the snapshot, build skips them
         self._index_raw = False     # reading raw data rather than objects
         self._index_years = {}      # event handle -> year, for labels
+        self._index_fallbacks = {}  # event handle -> birth/death fallback type
         self._index_spouses = {}    # person handle -> spouse surnames
+        self._index_mothers = {}    # family handle -> its wife's handle
         self._index_lifespan = {}   # person handle -> (birth year, death year)
+        self._index_forms = {}      # person handle -> whole-name word sets
         self._not_living = 0        # left out of the last search by date
+        self._already_listed = 0    # left out of the last search as listed
+        self._rebuild_id = 0        # idle source coalescing bulk rebuilds
+        self._applying = False      # inside our own apply transaction
+        self._notice = ""           # one-shot message for the status label
+        self._family_spouses = {}   # listed family handle -> spouse handles
+        self._recache_pending = set()   # people waiting to be re-cached
+        self._recache_id = 0        # idle source draining that set
         self.gui.WIDGET = self.build_gui()
         container = self.gui.get_container_widget()
         if self.gui.textview in container.get_children():
@@ -170,8 +392,12 @@ class AddParticipants(Gramplet):
         self.entry.set_placeholder_text(_("Type a name to add someone..."))
         self.entry.set_completion(completion)
         self.entry.connect("activate", self.on_entry_activate)
-        # Connected after set_completion so GTK's own handler runs first and
-        # then sees the reordered model.
+        # set_completion() installs GTK's own "changed" handler, so it runs
+        # first, against the model as it was - the refill below happens
+        # afterwards. What makes that come out right is the completion's
+        # filter model refiltering once the model changes underneath it,
+        # which is why _match_func has to go on matching every typed word
+        # against the folded search column rather than being simplified away.
         self.entry.connect("changed", self._update_completion)
         vbox.pack_start(self.entry, False, False, 0)
 
@@ -253,15 +479,101 @@ class AddParticipants(Gramplet):
         # A new tree invalidates the cached selection. Without this the
         # "did the handle change?" test in main() can leave the previous
         # tree's participants on screen.
+        # Count what is being thrown away first: once the model is empty
+        # main() has nothing left to count.
+        self._warn_discarded()
         self.event = None
         self.event_handle = None
         self.model.clear()
+        self._family_spouses = {}
+        # An import queued a rebuild against the tree that is going away;
+        # letting it fire would rebuild the new tree's index a second time.
+        self._cancel_rebuild()
         self.connect(self.dbstate.db, "person-add", self.on_people_changed)
         self.connect(self.dbstate.db, "person-update", self.on_people_changed)
         self.connect(self.dbstate.db, "person-delete", self.on_people_deleted)
+        # A married surname lives on the family record, not on the wife, so
+        # a family edit can change the name she is searchable under without
+        # any person-update ever naming her.
+        self.connect(self.dbstate.db, "family-add", self.on_families_changed)
+        self.connect(self.dbstate.db, "family-update", self.on_families_changed)
+        self.connect(self.dbstate.db, "family-delete", self.on_families_changed)
+        # Labels quote birth and death years, the alive filter compares
+        # against the selected event's year, and the chronological insert
+        # position is read off it - all of which go stale when an event is
+        # edited. active-changed cannot cover this: it only fires when the
+        # handle changes (gui/views/navigationview.py:206).
+        self.connect(self.dbstate.db, "event-update", self.on_events_changed)
+        self.connect(self.dbstate.db, "event-delete", self.on_events_deleted)
+        # Importers run with signals disabled and announce the result with
+        # request_rebuild() alone (gen/db/generic.py:2646), so without these
+        # a GEDCOM import into the open tree leaves every imported person
+        # unsearchable until the tree is reopened.
+        self.connect(self.dbstate.db, "person-rebuild", self.on_tree_rebuilt)
+        self.connect(self.dbstate.db, "family-rebuild", self.on_tree_rebuilt)
+        self.connect(self.dbstate.db, "event-rebuild", self.on_tree_rebuilt)
         self.connect_signal("Event", self.update)
         self.build_people_cache()
         self.build_role_model()
+
+    def on_tree_rebuilt(self, *_args):
+        """A bulk change that names no handles: rebuild everything.
+
+        request_rebuild() fires person-, family- and event-rebuild one after
+        another, so coalesce them onto a single idle turn rather than
+        rescanning the whole tree three times over.
+        """
+        if self._rebuild_id:
+            return
+        self._rebuild_id = GLib.idle_add(
+            self._do_rebuild, priority=GLib.PRIORITY_LOW
+        )
+
+    def _do_rebuild(self):
+        self._rebuild_id = 0
+        self.build_people_cache()
+        return False
+
+    def _cancel_rebuild(self):
+        """Drop a queued bulk rebuild, e.g. when the tree changes."""
+        if self._rebuild_id:
+            GLib.source_remove(self._rebuild_id)
+        self._rebuild_id = 0
+
+    def _queue_recache(self, handles):
+        """Re-cache a large batch of people a chunk at a time.
+
+        The signal handler that asked for it returns immediately: the work
+        costs a read per person plus their birth, death and family reads, and
+        a shared event whose date was corrected can name hundreds of them.
+        """
+        self._recache_pending.update(handles)
+        if not self._recache_id:
+            self._recache_id = GLib.idle_add(
+                self._recache_chunk, priority=GLib.PRIORITY_LOW
+            )
+
+    def _recache_chunk(self):
+        """Absorb one slice of the pending set, then yield to the main loop."""
+        batch = []
+        while self._recache_pending and len(batch) < RECACHE_CHUNK:
+            batch.append(self._recache_pending.pop())
+        try:
+            if batch:
+                self._recache_people(batch, removed=False)
+        except Exception:
+            LOG.exception("Add Participants: re-caching a batch failed")
+        if self._recache_pending:
+            return True
+        self._recache_id = 0
+        return False
+
+    def _cancel_recache(self):
+        """Drop any queued re-cache, e.g. when the whole index is rebuilt."""
+        if self._recache_id:
+            GLib.source_remove(self._recache_id)
+        self._recache_id = 0
+        self._recache_pending = set()
 
     def on_people_changed(self, handles=None):
         """Refresh only the people that actually changed.
@@ -275,22 +587,293 @@ class AddParticipants(Gramplet):
     def on_people_deleted(self, handles=None):
         self._recache_people(handles, removed=True)
 
-    def _recache_people(self, handles, removed):
+    def on_events_changed(self, handles=None):
+        """Re-read events whose dates other things quote.
+
+        Every year this gramplet shows or compares comes from an event, and
+        nothing else tells it when one moves: the header, the year _alive_at()
+        judges against, the years in every label, and the position a new
+        reference is inserted at.
+        """
+        if self._applying:
+            # Our own transaction is the source. on_apply refreshes the list
+            # itself, and re-running main() here would wipe its result.
+            return
         if handles is None:
             self.build_people_cache()
             return
         for handle in handles:
+            try:
+                event = self._get_event(handle)
+                year = 0 if event is None else _gregorian_year(
+                    event.get_date_object())
+            except Exception:
+                LOG.debug("could not re-read event %s", handle, exc_info=True)
+                continue
+            if year:
+                self._index_years[handle] = year
+            else:
+                self._index_years.pop(handle, None)
+        people = self._event_people(handles)
+        if people:
+            # Re-caching re-sorts the whole index, so an event nobody
+            # references is not worth the trip.
+            self._recache_people(sorted(people), removed=False)
+        self._reload_if_active(handles)
+
+    def on_events_deleted(self, handles=None):
+        """An event can go from under us - a delete, a merge, an undo."""
+        if self._applying:
+            return
+        if handles is None:
+            self.build_people_cache()
+            return
+        people = self._event_people(handles)
+        for handle in handles:
+            self._index_years.pop(handle, None)
+            self._index_fallbacks.pop(handle, None)
+        if people:
+            self._recache_people(sorted(people), removed=False)
+        if self.event_handle in handles:
+            # Count before clearing: main() cannot say what was discarded
+            # once the model it would count is empty.
+            self._warn_discarded()
+            self.event = None
+            self.event_handle = None
+            self.model.clear()
+            self.update()
+
+    def _event_people(self, handles):
+        """Everyone whose label or lifespan could quote one of these events."""
+        people = set()
+        for handle in handles:
+            try:
+                for _class_name, person in self.dbstate.db.find_backlink_handles(
+                        handle, ["Person"]):
+                    people.add(person)
+            except Exception:
+                LOG.debug("no backlinks for event %s", handle, exc_info=True)
+        return people
+
+    def _reload_if_active(self, handles):
+        """Refresh the view when the event it is showing was the one that
+        changed. Pending edits are kept: they address the *people*, not the
+        event, so they stay valid - but the list itself is only reloaded
+        when there is nothing staged to lose."""
+        if self.event_handle not in handles:
+            return
+        if any(self.pending_counts()):
+            self._report(_("This event changed elsewhere; "
+                           "Revert reloads the list"))
+        else:
+            # Forces load_participants() on the way through main().
+            self.event_handle = None
+        self.update()
+
+    def on_families_changed(self, handles=None):
+        """A wife's married surname comes from the family, so keep it in step.
+
+        Deleting or unlinking a husband commits the family but never the
+        wife, and no person-update ever names her: without this she stays
+        searchable, and labelled, under a surname she is no longer known by.
+        """
+        if handles is None:
+            self.build_people_cache()
+            return
+        wives = set()
+        active_event = self.event_handle
+        listed = {
+            row[COL_HANDLE]
+            for row in self.model
+            if row[COL_KIND] == "Family"
+        }
+        reload_rows = False
+        for handle in handles:
+            try:
+                # The wife the family used to have, for the case where the
+                # family itself is gone and cannot be asked any more.
+                previous = self._index_mothers.pop(handle, None)
+                if previous:
+                    wives.add(previous)
+                family = self._get_family(handle)
+                if family is None:
+                    # A family that is listed but gone covers nobody now.
+                    self._family_spouses.pop(handle, None)
+                    if handle in listed:
+                        reload_rows = True
+                    continue
+                mother = family.get_mother_handle()
+                if mother:
+                    self._index_mothers[handle] = mother
+                    wives.add(mother)
+                if (active_event and not reload_rows
+                        and any(ref.ref == active_event
+                                for ref in family.get_event_ref_list())):
+                    reload_rows = True
+                if handle in self._family_spouses:
+                    # A spouse just unlinked stops being covered by this
+                    # row, and one just linked starts.
+                    self._family_spouses[handle] = tuple(
+                        spouse
+                        for spouse in (family.get_father_handle(), mother)
+                        if spouse
+                    )
+            except Exception:
+                # One unreadable family must not abandon the rest.
+                LOG.debug("could not re-read family %s", handle, exc_info=True)
+        if wives:
+            self._recache_people(sorted(wives), removed=False)
+        if reload_rows and self.event is not None:
+            if any(self.pending_counts()):
+                self._report(_("A family participant changed elsewhere; "
+                               "Revert reloads the list"))
+                self.update_status()
+            else:
+                self.load_participants()
+                self.refresh_completion()
+                self.update_status()
+        else:
+            self.refresh_completion()
+
+    def _recache_people(self, handles, removed):
+        if handles is None:
+            self.build_people_cache()
+            return
+        if not removed and len(handles) > RECACHE_CHUNK:
+            # Too many to read inside a signal handler - see _queue_recache.
+            # A deletion is cheap (no reads at all) and has to take effect at
+            # once, so it never goes this way.
+            self._queue_recache(handles)
+            return
+        removed_set = set(handles) if removed else set()
+        # Read each touched person and family once; the spouse lookups below
+        # go through the same two memos, so a person with no families still
+        # costs a single read, as before.
+        people = {}
+        families = {}
+
+        def person_at(handle):
+            """The person behind a handle, read at most once per call."""
+            if handle not in people:
+                people[handle] = self._get_person(handle)
+            return people[handle]
+
+        def family_at(handle):
+            """The family behind a handle, read at most once per call."""
+            if handle not in families:
+                families[handle] = self._get_family(handle)
+            return families[handle]
+
+        for handle in handles:
+            if handle not in removed_set:
+                person_at(handle)
+        # Rebuild the labels of the touched people plus any spouse whose
+        # married-surname set depends on one of them: a new or renamed husband
+        # changes the name his wives are searchable by, and a new wife gains
+        # the surname she married into.
+        to_cache = set(people)
+        to_cache.update(removed_set)
+        for handle, person in list(people.items()):
+            if person is None:
+                continue
+            # One corrupt record must not abandon the rest of the batch: an
+            # exception here is swallowed by Callback.emit with nothing but a
+            # log line (gen/utils/callback.py:427), which is the silent
+            # staleness the per-row index guards exist to prevent.
+            try:
+                to_cache.update(
+                    self._spouse_dependents(handle, person, family_at))
+            except Exception:
+                LOG.debug("could not read the families of %s", handle,
+                          exc_info=True)
+        # Keep the married-surname map in step before the labels are rebuilt,
+        # since both the label and the search text read from it.
+        for handle in to_cache:
+            if handle in removed_set:
+                self._index_spouses.pop(handle, None)
+                continue
+            try:
+                person = person_at(handle)
+                if person is not None:
+                    self._index_spouses[handle] = self._spouse_surnames_for(
+                        handle, person, family_at, person_at)
+            except Exception:
+                LOG.debug("could not refresh the married surnames of %s",
+                          handle, exc_info=True)
+        for handle in to_cache:
             self.people_labels.pop(handle, None)
-            if not removed:
-                person = self._get_person(handle)
+            if handle in removed_set:
+                self._index_lifespan.pop(handle, None)
+                self._index_forms.pop(handle, None)
+                continue
+            try:
+                person = person_at(handle)
                 if person is not None:
                     self.people_labels[handle] = self._person_entry(person)
+            except Exception:
+                LOG.debug("could not re-index %s", handle, exc_info=True)
         if self._index_id:
             # A build is in flight; it publishes the sorted list when it
             # finishes, so skip the expensive re-sort but keep the change -
             # iter_people() may already be past this person.
+            #
+            # The raw build walks a snapshot of the table taken before these
+            # changes, so mark the handles it must not clobber: an add or
+            # update is already reflected above, and a delete must stay gone.
+            self._index_touched.update(to_cache)
             return
         self._sort_people_cache()
+
+    @staticmethod
+    def _primary_surname(person):
+        if person is None:
+            return ""
+        primary = person.get_primary_name()
+        return primary.get_surname() if primary else ""
+
+    def _spouse_surnames_for(self, handle, person, family_at=None,
+                             person_at=None):
+        """Surnames `person` is known by through marriage, read live from her
+        families: for each family where she is the wife, the husband's
+        surname unless it is already her own. Mirrors _build_spouse_map for a
+        single person, so someone added or renamed mid-session is searchable
+        by the name she married into without a full rebuild.
+
+        `family_at` and `person_at` are the caller's memos, so a batch that
+        touches a husband and his wives walks each family once between them
+        rather than once per helper."""
+        family_at = family_at or self._get_family
+        person_at = person_at or self._get_person
+        own = self._primary_surname(person)
+        result = set()
+        for fam_handle in person.family_list:
+            family = family_at(fam_handle)
+            if family is None or family.get_mother_handle() != handle:
+                continue
+            father = family.get_father_handle()
+            if not father:
+                continue
+            surname = self._primary_surname(person_at(father))
+            if surname and surname != own:
+                result.add(surname)
+        return sorted(result)
+
+    def _spouse_dependents(self, handle, person, family_at=None):
+        """Spouses whose surname set includes `person`'s - her husbands' wives
+        take his surname, so they must be re-cached when a husband is added or
+        renamed; a wife's own set does not depend on anyone else's.
+
+        `family_at` is the caller's memo, shared with _spouse_surnames_for so
+        the same families are not walked twice per batch."""
+        family_at = family_at or self._get_family
+        wives = set()
+        for fam_handle in person.family_list:
+            family = family_at(fam_handle)
+            if family is not None and family.get_father_handle() == handle:
+                mother = family.get_mother_handle()
+                if mother:
+                    wives.add(mother)
+        return wives
 
     # Gramps raises HandleError for a dangling handle rather than returning
     # None, so every lookup needs a guard: one broken reference anywhere in
@@ -323,9 +906,14 @@ class AddParticipants(Gramplet):
         that anything is happening.
         """
         self._cancel_index()
+        # A full rebuild supersedes anything queued against the old index.
+        self._cancel_recache()
         db = self.dbstate.db
         self.people_labels = {}
         self._index_lifespan = {}
+        self._index_forms = {}
+        self._index_mothers = {}
+        self._index_touched = set()
         self._sort_people_cache()
         if db is None or not db.is_open():
             self._show_index_progress(done=True)
@@ -338,8 +926,10 @@ class AddParticipants(Gramplet):
         # Person or Event is ever constructed.
         self._index_raw = True
         self._index_years = {}
+        self._index_fallbacks = {}
         try:
-            self._index_years = self._build_year_map(db)
+            self._index_years, self._index_fallbacks = \
+                self._build_event_maps(db)
             with db.get_person_cursor() as cursor:
                 rows = [data for _handle, data in cursor]
             self._index_spouses = self._build_spouse_map(
@@ -357,6 +947,7 @@ class AddParticipants(Gramplet):
                       exc_info=True)
             self._index_raw = False
             self._index_years = {}
+            self._index_fallbacks = {}
             try:
                 handles = list(db.get_person_handles())
             except Exception:
@@ -382,42 +973,99 @@ class AddParticipants(Gramplet):
     def _index_chunk(self):
         """Absorb one slice of people, then yield back to the main loop."""
         if self._index_iter is None:
-            self._index_id = 0
+            self._finish_index()
             return False
         absorbed = 0
-        for item in self._index_iter:
-            if self._index_raw:
-                self.people_labels[item["handle"]] = self._raw_person_entry(item)
-            else:
-                person = self._get_person(item)
-                if person is not None:
-                    self.people_labels[item] = self._person_entry(person)
-            absorbed += 1
-            if absorbed >= INDEX_CHUNK:
-                self._show_index_progress(done=False)
-                return True
-        # Exhausted: publish the finished index.
+        try:
+            for item in self._index_iter:
+                self._index_one(item)
+                absorbed += 1
+                if absorbed >= INDEX_CHUNK:
+                    self._show_index_progress(done=False)
+                    return True
+        except Exception:
+            # Anything that escapes here takes the idle source with it:
+            # PyGObject drops the callback, _index_id stays set, the search
+            # box sits on "Indexing names..." for the rest of the session and
+            # the sorted index is never published. Publish what there is.
+            LOG.exception(
+                "Add Participants: indexing stopped early; "
+                "the name index may be incomplete"
+            )
+        self._finish_index()
+        return False
+
+    def _finish_index(self):
+        """Publish the index and clear the idle bookkeeping.
+
+        Every exit from _index_chunk comes through here, successful or not:
+        leaving _index_id set once the idle source is gone is what strands
+        the placeholder and the completion.
+        """
         self._index_id = 0
         self._index_iter = None
         self._sort_people_cache()
         self._show_index_progress(done=True)
-        return False
 
-    def _build_year_map(self, db):
-        """Event handle -> year, for every dated event, in a single query."""
+    def _index_one(self, item):
+        """Absorb one person, degrading a bad raw row to the object API.
+
+        build_people_cache() proves the raw layout on the first row only, so
+        a row further in that does not fit is the first sign the stored shape
+        is not what this expects. Read that one person as an object rather
+        than losing the rest of the build.
+        """
+        if not self._index_raw:
+            self._index_person_object(item)
+            return
+        handle = None
+        try:
+            handle = item["handle"]
+            # A concurrent add/update/delete owns this row now; the
+            # pre-captured snapshot is stale for it, so leave it alone
+            # rather than clobbering the fresher value (or re-adding a
+            # person who was deleted).
+            if handle in self._index_touched:
+                return
+            self.people_labels[handle] = self._raw_person_entry(item)
+        except Exception:
+            LOG.debug("raw row unusable; reading %s as an object", handle,
+                      exc_info=True)
+            if handle and handle not in self._index_touched:
+                self._index_person_object(handle)
+
+    def _index_person_object(self, handle):
+        """Index one person through the object API, or skip them.
+
+        A person nothing can read is left out of the offer rather than
+        stopping everyone else from being indexed.
+        """
+        try:
+            person = self._get_person(handle)
+            if person is not None:
+                self.people_labels[handle] = self._person_entry(person)
+        except Exception:
+            LOG.debug("could not index person %s", handle, exc_info=True)
+
+    def _build_event_maps(self, db):
+        """(handle -> Gregorian year, handle -> fallback type) in one query.
+
+        The second map holds only the types that can stand in for a missing
+        birth or death, which is the only reason the raw path needs an event
+        type at all.
+        """
         years = {}
+        fallbacks = {}
         with db.get_event_cursor() as cursor:
             for _handle, data in cursor:
-                date = data["date"]
-                if not date:
-                    continue
-                dateval = date["dateval"]
-                if not dateval or len(dateval) <= 2:
-                    continue
-                year = dateval[2]
+                handle = data["handle"]
+                year = _raw_year(data["date"])
                 if year:
-                    years[data["handle"]] = year
-        return years
+                    years[handle] = year
+                value = data["type"]["value"]
+                if value in BIRTH_FALLBACKS or value in DEATH_FALLBACKS:
+                    fallbacks[handle] = value
+        return years, fallbacks
 
     def _build_spouse_map(self, db, surname_by_handle):
         """Person handle -> surnames they married into.
@@ -436,6 +1084,10 @@ class AddParticipants(Gramplet):
         not the reverse, so the surname is never exchanged - a husband must
         not become findable under his wife's maiden name. Matching both ways
         turned a search for "John Joy" into every John married to a Joy.
+
+        It also fills _index_mothers on the way past, which is how
+        on_families_changed finds the wife of a family that has since been
+        deleted and can no longer be asked.
         """
         if surname_by_handle is None:
             surname_by_handle = {
@@ -444,27 +1096,35 @@ class AddParticipants(Gramplet):
                 for person in db.iter_people()
             }
         spouses = {}
+        mothers = {}
         with db.get_family_cursor() as cursor:
             for _handle, data in cursor:
                 father = data["father_handle"]
                 mother = data["mother_handle"]
+                if mother:
+                    mothers[data["handle"]] = mother
                 if not father or not mother:
                     continue
                 surname = surname_by_handle.get(father)
                 if surname and surname != surname_by_handle.get(mother):
                     spouses.setdefault(mother, set()).add(surname)
+        self._index_mothers = mothers
         return {handle: sorted(names) for handle, names in spouses.items()}
 
     def _other_names(self, handle, primary_given, primary_surname,
-                     alt_givens, alt_surnames):
+                     alt_givens, alt_surnames, nicks, calls):
         """Every other name this person answers to, for the label.
 
         Anything here can make the person match, so it has to be visible:
         otherwise searching "Loretta" turns up "Casey, Lura Ruth" with no
         indication of why. Alternate surnames appear as they are, an
-        alternate given name is marked "aka", and a surname reached by
-        marriage is marked "m." - which reads correctly for a husband too,
-        since he is not known by his wife's surname but is married to it.
+        alternate given name is marked "aka", a nickname "nicknamed", a call
+        name "called", and a surname reached by marriage "m." - which reads
+        correctly for a husband too, since he is not known by his wife's
+        surname but is married to it.
+
+        A call name is usually one of the given names already shown, so it
+        only earns a place when it is not.
         """
         others = []
         for surname in alt_surnames:
@@ -475,64 +1135,135 @@ class AddParticipants(Gramplet):
                 marked = _("aka %s") % given
                 if marked not in others:
                     others.append(marked)
+        for nick in nicks:
+            if nick:
+                marked = _("nicknamed %s") % nick
+                if marked not in others:
+                    others.append(marked)
+        given_words = set(_fold(
+            " ".join([primary_given] + [g for g in alt_givens if g])).split())
+        for call in calls:
+            if not call:
+                continue
+            call_words = set(_fold(call).split())
+            if call_words and call_words <= given_words:
+                continue   # already visible as one of the given names
+            marked = _("called %s") % call
+            if marked not in others:
+                others.append(marked)
         for surname in self._index_spouses.get(handle, ()):
             marked = _("m. %s") % surname  # married into, not her own
             if surname != primary_surname and marked not in others:
                 others.append(marked)
         return others
 
+    @staticmethod
+    def _decorate(name, others, years):
+        """name [other names] (b. YYYY d. YYYY).
+
+        One place, so the raw and object paths cannot format the same person
+        differently - that byte-parity is what the tests hold them to.
+        """
+        label = name
+        if others:
+            label += " [%s]" % ", ".join(others)
+        marked = ["%s %d" % (marker, year)
+                  for marker, year in zip(("b.", "d."), years) if year]
+        if marked:
+            label += " (%s)" % " ".join(marked)
+        return label
+
+    def _raw_person_years(self, data):
+        """(birth year, death year, birth grace) from stored data.
+
+        Plenty of people have no birth event at all, only a christening, and
+        no death event, only a burial. Reading nothing but
+        birth_ref_index/death_ref_index left them with no years in the label
+        and nothing for _alive_at() to exclude them by - a filter that fires
+        on more people, not fewer, which is the point of it.
+
+        What is wanted here is a *year*, not an event, so an undated birth
+        or death event does not block a dated fallback from supplying one.
+        That is a deliberate departure from get_birth_or_fallback(), which
+        stops at the first primary reference whether it carries a date or
+        not. The third value is the grace _alive_at() must allow on the
+        lower bound, non-zero exactly when the birth year is really a
+        christening year.
+        """
+        refs = data["event_ref_list"]
+        years = [0, 0]
+        found = [False, False]
+        grace = 0
+        for slot, key in enumerate(("birth_ref_index", "death_ref_index")):
+            index = data[key]
+            if index is not None and 0 <= index < len(refs):
+                years[slot] = self._index_years.get(refs[index]["ref"], 0)
+                found[slot] = bool(years[slot])
+        if not all(found):
+            for ref in refs:
+                if all(found):
+                    break
+                if ref["role"]["value"] != EventRoleType.PRIMARY:
+                    continue
+                value = self._index_fallbacks.get(ref["ref"])
+                if value is None:
+                    continue
+                year = self._index_years.get(ref["ref"], 0)
+                if not year:
+                    continue
+                # A stillbirth stands in for both, so neither test excludes
+                # the other - the same as get_birth_or_fallback() and
+                # get_death_or_fallback() run independently.
+                if not found[0] and value in BIRTH_FALLBACKS:
+                    years[0] = year
+                    found[0] = True
+                    grace = BIRTH_GRACE
+                if not found[1] and value in DEATH_FALLBACKS:
+                    years[1] = year
+                    found[1] = True
+        return (years[0], years[1], grace)
+
     def _raw_person_entry(self, data):
         """(label, folded search text) straight from stored person data."""
-        refs = data["event_ref_list"]
-        years = []
-        for key in ("birth_ref_index", "death_ref_index"):
-            index = data[key]
-            year = 0
-            if index is not None and 0 <= index < len(refs):
-                year = self._index_years.get(refs[index]["ref"], 0)
-            years.append(year)
-        self._index_lifespan[data["handle"]] = tuple(years)
-        label = self._raw_person_label(data)
+        years = self._raw_person_years(data)
+        self._index_lifespan[data["handle"]] = years
+        label = self._raw_person_label(data, years)
         return label, self._raw_person_search_text(data, label)
 
-    def _raw_person_label(self, data):
+    def _raw_person_label(self, data, years):
         """The object path's _person_label, without building a Person."""
         primary = data["primary_name"]
         alternates = data["alternate_names"]
         name = name_displayer.raw_display_name(primary)
         primary_surname = _raw_surname(primary)
+        all_names = [primary] + list(alternates)
         others = self._other_names(
             data["handle"], primary["first_name"], primary_surname,
             [alt["first_name"] for alt in alternates],
             [_raw_surname(alt) for alt in alternates],
+            [one["nick"] for one in all_names],
+            [one["call"] for one in all_names],
         )
-        years = []
-        refs = data["event_ref_list"]
-        for key, marker in (("birth_ref_index", "b."),
-                            ("death_ref_index", "d.")):
-            index = data[key]
-            if index is None or index < 0 or index >= len(refs):
-                continue
-            year = self._index_years.get(refs[index]["ref"])
-            if year:
-                years.append("%s %d" % (marker, year))
-        label = name
-        if others:
-            label += " [%s]" % ", ".join(others)
-        if years:
-            label += " (%s)" % " ".join(years)
-        return label
+        return self._decorate(name, others, years)
 
     def _raw_person_search_text(self, data, label):
-        """The object path's _person_search_text, from stored data."""
+        """The object path's _person_search_text, from stored data.
+
+        Records this person's whole-name forms in _index_forms on the way
+        past, the same as its twin does.
+        """
         parts = [label]
+        forms = []
         for name_data in [data["primary_name"]] + list(data["alternate_names"]):
-            parts.append(name_displayer.raw_display_name(name_data))
+            display = name_displayer.raw_display_name(name_data)
+            forms.append(display)
+            parts.append(display)
             parts.append(name_data["first_name"])
             parts.append(_raw_surname(name_data))
             parts.append(name_data["call"])
             parts.append(name_data["nick"])
         parts.extend(self._index_spouses.get(data["handle"], ()))
+        self._index_forms[data["handle"]] = _form_keys(forms)
         return _fold(" ".join(part for part in parts if part))
 
     def _show_index_progress(self, done):
@@ -556,38 +1287,28 @@ class AddParticipants(Gramplet):
         # The completion is built from this list, so it has to be rebuilt.
         self.refresh_completion(force=True)
 
-    def _person_label(self, person):
-        """Primary name, any other surnames, then birth/death years."""
+    def _person_label(self, person, years=None):
+        """Primary name, any other surnames, then birth/death years.
+
+        `years` is the pair _person_entry has already read; passing it in
+        stops the birth and death events being fetched twice per person.
+        """
+        if years is None:
+            years = self._person_years(person)
         name = name_displayer.display(person)
         primary = person.get_primary_name()
         primary_surname = primary.get_surname() if primary else ""
         primary_given = primary.get_first_name() if primary else ""
         alternates = person.get_alternate_names()
+        all_names = ([primary] if primary else []) + list(alternates)
         others = self._other_names(
             person.get_handle(), primary_given, primary_surname,
             [alt.get_first_name() for alt in alternates],
             [alt.get_surname() for alt in alternates],
+            [one.get_nick_name() for one in all_names],
+            [one.get_call_name() for one in all_names],
         )
-        years = []
-        for ref, marker in (
-            (person.get_birth_ref(), "b."),
-            (person.get_death_ref(), "d."),
-        ):
-            year = ""
-            if ref:
-                event = self._get_event(ref.ref)
-                if event:
-                    date = event.get_date_object()
-                    if date and date.get_year():
-                        year = str(date.get_year())
-            if year:
-                years.append("%s %s" % (marker, year))
-        label = name
-        if others:
-            label += " [%s]" % ", ".join(others)
-        if years:
-            label += " (%s)" % " ".join(years)
-        return label
+        return self._decorate(name, others, years)
 
     def _person_search_text(self, person, label):
         """Every form of the name, folded, for the type-ahead to search.
@@ -595,31 +1316,73 @@ class AddParticipants(Gramplet):
         A married name is an *alternate* name, so searching only the primary
         name never finds it. This walks [primary] + alternates, the same
         idiom the rest of Gramps uses.
+
+        Records this person's whole-name forms in _index_forms on the way
+        past: that is what the Enter key compares typed text against, and
+        the forms are already in hand here.
         """
         parts = [label]
+        forms = []
         for name in [person.get_primary_name()] + person.get_alternate_names():
-            parts.append(name_displayer.display_name(name))
+            display = name_displayer.display_name(name)
+            forms.append(display)
+            parts.append(display)
             parts.append(name.get_first_name())
             parts.append(name.get_surname())
             parts.append(name.get_call_name())
             parts.append(name.get_nick_name())
         parts.extend(self._index_spouses.get(person.get_handle(), ()))
+        self._index_forms[person.get_handle()] = _form_keys(forms)
         return _fold(" ".join(part for part in parts if part))
+
+    def _ref_year(self, ref):
+        """The Gregorian year of the event a reference points at, or 0."""
+        event = self._get_event(ref.ref)
+        if event is None:
+            return 0
+        return _gregorian_year(event.get_date_object())
+
+    def _person_years(self, person):
+        """(birth year, death year, birth grace), 0 for unknown.
+
+        The object-path twin of _raw_person_years: a christening stands in
+        for a missing birth and a burial for a missing death, the same
+        substitutes gen/utils/db.py:53 accepts, and an undated primary event
+        does not block a dated fallback.
+        """
+        years = [0, 0]
+        found = [False, False]
+        grace = 0
+        for slot, ref in enumerate((person.get_birth_ref(),
+                                    person.get_death_ref())):
+            if ref:
+                years[slot] = self._ref_year(ref)
+                found[slot] = bool(years[slot])
+        if not all(found):
+            for ref in person.get_primary_event_ref_list():
+                if all(found):
+                    break
+                event = self._get_event(ref.ref)
+                if event is None:
+                    continue
+                year = _gregorian_year(event.get_date_object())
+                if not year:
+                    continue
+                etype = event.get_type()
+                if not found[0] and etype.is_birth_fallback():
+                    years[0] = year
+                    found[0] = True
+                    grace = BIRTH_GRACE
+                if not found[1] and etype.is_death_fallback():
+                    years[1] = year
+                    found[1] = True
+        return (years[0], years[1], grace)
 
     def _person_entry(self, person):
         """(display label, folded search text) for one person."""
-        years = []
-        for ref in (person.get_birth_ref(), person.get_death_ref()):
-            year = 0
-            if ref:
-                event = self._get_event(ref.ref)
-                if event:
-                    date = event.get_date_object()
-                    if date:
-                        year = date.get_year() or 0
-            years.append(year)
-        self._index_lifespan[person.get_handle()] = tuple(years)
-        label = self._person_label(person)
+        years = self._person_years(person)
+        self._index_lifespan[person.get_handle()] = years
+        label = self._person_label(person, years)
         return label, self._person_search_text(person, label)
 
     def _family_label(self, family):
@@ -669,6 +1432,8 @@ class AddParticipants(Gramplet):
         self.event = self._get_event(handle) if handle else None
 
         if self.event is None:
+            if self.event_handle is not None:
+                self._warn_discarded()
             self.event_handle = None
             self.model.clear()
             self.completion_model.clear()
@@ -679,6 +1444,8 @@ class AddParticipants(Gramplet):
         # Only rebuild when the event actually changed, so pending edits
         # survive an incidental refresh.
         if handle != self.event_handle:
+            if self.event_handle is not None:
+                self._warn_discarded()
             self.event_handle = handle
             self.load_participants()
 
@@ -695,9 +1462,26 @@ class AddParticipants(Gramplet):
         self.refresh_completion()
         self.update_status()
 
+    def _warn_discarded(self):
+        """Say so when moving to another event throws staged edits away.
+
+        Not a dialog: this runs from the history's active-changed handler,
+        where re-entering the main loop is not safe. A message in both
+        places the user might be looking is enough to stop a batch of edits
+        vanishing without a word.
+        """
+        pending = sum(self.pending_counts())
+        if not pending:
+            return
+        self._report(
+            _("Discarded %d pending change(s) on the previous event")
+            % pending
+        )
+
     def load_participants(self):
         """Populate the list from everything referencing this event."""
         self.model.clear()
+        self._family_spouses = {}
         db = self.dbstate.db
         ev_handle = self.event.get_handle()
 
@@ -706,6 +1490,10 @@ class AddParticipants(Gramplet):
                 db.find_backlink_handles(ev_handle, ["Person", "Family"])
             )
         except Exception:
+            # An empty list here reads as "nobody is attached to this event",
+            # which is exactly what a broken lookup must not be mistaken for.
+            LOG.exception("Add Participants: could not read the participants "
+                          "of event %s", ev_handle)
             backlinks = []
 
         for class_name, handle in backlinks:
@@ -715,19 +1503,86 @@ class AddParticipants(Gramplet):
             elif class_name == "Family":
                 obj = self._get_family(handle)
                 label = self._family_label(obj) if obj else None
+                if obj is not None:
+                    # Noted here, once, so the offer's bookkeeping never has
+                    # to read the family back out of the database.
+                    self._family_spouses[handle] = tuple(
+                        spouse for spouse in (obj.get_father_handle(),
+                                              obj.get_mother_handle())
+                        if spouse
+                    )
             else:
                 continue
             if obj is None:
                 continue
-            for index, ref in enumerate(obj.get_event_ref_list()):
+            # Rows record *which* of this object's references to this event
+            # they stand for, not where it sits in the whole list: an
+            # unrelated reference added or removed elsewhere shifts the raw
+            # index but not this.
+            nth = 0
+            for ref in obj.get_event_ref_list():
                 if ref.ref != ev_handle:
                     continue
                 role = str(ref.get_role())
                 self.model.append(
                     [label, role, STATE_EXISTING, handle,
-                     class_name, role, index, int(Pango.Weight.NORMAL),
+                     class_name, role, nth, int(Pango.Weight.NORMAL),
                      STATE_TEXT[STATE_EXISTING]]
                 )
+                nth += 1
+
+    def _covered_by_family(self):
+        """Spouses a family row that is staying attached already covers.
+
+        A participating family's reference stands for both its spouses, and
+        that is how the Events view counts them, so offering one of them
+        again is offering a duplicate: accepting it writes a second,
+        personal reference at Primary and the Main Participants column
+        counts them twice. Attaching a spouse in their own right, with a
+        role of their own, is still possible the stock way.
+
+        The spouse handles were read when the row was loaded
+        (_family_spouses), so this stays a walk over the model: it runs
+        ahead of refresh_completion's early return, and re-reading every
+        listed family from the database on each keystroke's worth of
+        bookkeeping defeated the point of that early return.
+        """
+        covered = set()
+        for row in self.model:
+            if row[COL_KIND] == "Family" and row[COL_STATE] != STATE_DETACH:
+                covered.update(self._family_spouses.get(row[COL_HANDLE], ()))
+        return covered
+
+    def _listed_person_handles(self):
+        """Everyone the participant list already covers."""
+        listed = self._covered_by_family()
+        for row in self.model:
+            if row[COL_KIND] == "Person" and row[COL_STATE] != STATE_DETACH:
+                listed.add(row[COL_HANDLE])
+        return frozenset(listed)
+
+    def _drop_covered_staged(self):
+        """Unstage anyone a family row has just taken back over.
+
+        Detaching a family releases its spouses into the offer, so one can
+        be staged personally; putting the family back covers them again, and
+        applying both would write the very duplicate reference
+        _covered_by_family exists to prevent.
+        """
+        covered = self._covered_by_family()
+        if not covered:
+            return
+        dropped = []
+        for index in reversed(range(len(self.model))):
+            row = self.model[index]
+            if (row[COL_STATE] == STATE_NEW and row[COL_KIND] == "Person"
+                    and row[COL_HANDLE] in covered):
+                dropped.append(row[COL_NAME])
+                del self.model[index]
+        if dropped:
+            self._notice = _("Unstaged %s: covered by a family again") % (
+                ", ".join(reversed(dropped))
+            )
 
     def refresh_completion(self, force=False):
         """Note who is already listed and refresh what the type-ahead offers.
@@ -736,11 +1591,7 @@ class AddParticipants(Gramplet):
         of excluded people actually moved. Callers that changed the people
         cache itself pass force=True.
         """
-        listed = frozenset(
-            row[COL_HANDLE]
-            for row in self.model
-            if row[COL_KIND] == "Person" and row[COL_STATE] != STATE_DETACH
-        )
+        listed = self._listed_person_handles()
         if not force and listed == self._completion_excluded:
             return
         self._completion_excluded = listed
@@ -760,13 +1611,10 @@ class AddParticipants(Gramplet):
             self.completion_model.append([label, handle, search])
 
     def _event_year(self):
-        """Year of the selected event, or 0 when it is undated."""
+        """Gregorian year of the selected event, or 0 when it is undated."""
         if self.event is None:
             return 0
-        date = self.event.get_date_object()
-        if not date:
-            return 0
-        return date.get_year() or 0
+        return _gregorian_year(self.event.get_date_object())
 
     def _alive_at(self, handle, year):
         """True, False, or None when neither date is recorded.
@@ -774,11 +1622,15 @@ class AddParticipants(Gramplet):
         Only a wholly undated person is unknown. One date is enough to infer
         the other to within MAX_LIFESPAN, which is what makes this worth
         anything: most people here have a birth year and no death year.
+
+        `birth_grace` is BIRTH_GRACE when the birth year is really a
+        christening year, and 0 when it is a birth - the mirror of
+        DEATH_GRACE on the other end.
         """
-        birth, death = self._index_lifespan.get(handle, (0, 0))
+        birth, death, birth_grace = self._index_lifespan.get(handle, (0, 0, 0))
         if not birth and not death:
             return None
-        if birth and year < birth:
+        if birth and year < birth - birth_grace:
             return False
         if death and year > death + DEATH_GRACE:
             return False
@@ -788,8 +1640,11 @@ class AddParticipants(Gramplet):
             return False
         return True
 
-    def _ranked_matches(self, text):
+    def _ranked_matches(self, text, folded=None):
         """(label, handle, search) for every match, best first.
+
+        `folded` lets a caller that has already folded the typed text hand
+        the result in rather than paying for it twice.
 
         Scoring is per typed word against the words of the indexed text:
         landing on a whole word beats starting one, which beats appearing in
@@ -797,17 +1652,21 @@ class AddParticipants(Gramplet):
         name lives, ahead of alternate and married surnames - count for more.
         So "John Joy" puts "Joy, John Mervyn" above "Johnson, Bonnie [m. Joy]".
         """
-        tokens = _fold(text).split()
+        tokens = (_fold(text) if folded is None else folded).split()
         if not tokens:
             return []
         event_year = self._event_year()
         self._not_living = 0
+        self._already_listed = 0
         scored = []
         for label, handle, search in self.people_cache:
-            if handle in self._completion_excluded:
-                continue
-            # Cheap reject first; only survivors are worth scoring.
+            # Cheap reject first; only survivors are worth scoring. The two
+            # reasons a match is then dropped are counted, so that a search
+            # coming back empty can say which one emptied it.
             if not all(token in search for token in tokens):
+                continue
+            if handle in self._completion_excluded:
+                self._already_listed += 1
                 continue
             if event_year and self._alive_at(handle, event_year) is False:
                 self._not_living += 1
@@ -862,25 +1721,51 @@ class AddParticipants(Gramplet):
         text = entry.get_text().strip()
         if not text:
             return
-        matches = self._ranked_matches(text)
-        exact = [row for row in matches if _fold(row[0]) == _fold(text)]
+        folded = _fold(text)
+        matches = self._ranked_matches(text, folded)
+        # An exact hit on one of a person's own name forms wins outright.
+        # Compared against the name, not the label: the label carries years
+        # and bracketed annotations, so anyone with a date could never be an
+        # exact match at all, and it insisted on surname-first order, which
+        # is not how anybody types.
+        typed = frozenset(folded.split())
+        exact = [row for row in matches
+                 if typed in self._index_forms.get(row[1], ())]
         if exact:
             matches = exact
         if len(matches) == 1:
             self.stage_person(matches[0][0], matches[0][1])
             entry.set_text("")
-        elif not matches and self._not_living:
-            self.status.set_text(
-                _("No match for '%(text)s' (%(count)d not living then)")
-                % {"text": text, "count": self._not_living}
-            )
-        elif not matches:
-            self.status.set_text(_("No match for '%s'") % text)
-        else:
+            return
+        if matches:
             self.status.set_text(
                 _("%(count)d people match '%(text)s'")
                 % {"count": len(matches), "text": text}
             )
+            return
+        if self._index_id:
+            # Nothing matches yet because most of the tree is not in the
+            # index yet, which reads as a broken search otherwise.
+            self.status.set_text(
+                _("Still indexing names - try '%s' again in a moment") % text
+            )
+            return
+        # An empty result that something filtered has to say so, or the
+        # person who was filtered out reads as a search that does not work.
+        reasons = []
+        if self._already_listed:
+            reasons.append(
+                _("%d already a participant") % self._already_listed
+            )
+        if self._not_living:
+            reasons.append(_("%d not living then") % self._not_living)
+        if reasons:
+            self.status.set_text(
+                _("No match for '%(text)s' (%(reasons)s)")
+                % {"text": text, "reasons": ", ".join(reasons)}
+            )
+        else:
+            self.status.set_text(_("No match for '%s'") % text)
 
     def stage_person(self, label, handle):
         # Always take the indexed label rather than whatever was displayed,
@@ -889,16 +1774,26 @@ class AddParticipants(Gramplet):
         known = self.people_labels.get(handle)
         if known:
             label = known[0]
-        for row in self.model:
-            if row[COL_HANDLE] == handle and row[COL_KIND] == "Person":
-                # refresh_completion() keeps detach-staged people in the
-                # type-ahead, so picking one again has to mean "undo the
-                # detach" rather than silently doing nothing.
+        rows = [row for row in self.model
+                if row[COL_HANDLE] == handle and row[COL_KIND] == "Person"]
+        if rows:
+            # refresh_completion() keeps detach-staged people in the
+            # type-ahead, so picking one again has to mean "undo the detach"
+            # rather than silently doing nothing - and for every row of
+            # theirs, since an object can hold two references to one event.
+            for row in rows:
                 if row[COL_STATE] == STATE_DETACH:
                     self._set_state(row, STATE_EXISTING)
-                    self.refresh_completion()
-                    self.update_status()
-                return
+            self.refresh_completion()
+            self.update_status()
+            return
+        if handle in self._completion_excluded:
+            # Not listed as a person, but covered by a participating family
+            # - see _listed_person_handles.
+            self.status.set_text(
+                _("%s already takes part through a family") % label
+            )
+            return
         self.model.append(
             [label, self._default_role(), STATE_NEW, handle,
              "Person", "", -1, int(Pango.Weight.BOLD),
@@ -935,13 +1830,36 @@ class AddParticipants(Gramplet):
         completion.set_inline_completion(True)
         entry.set_completion(completion)
 
+    def _canonical_role(self, text):
+        """Snap a typed role onto a known one, ignoring case and padding.
+
+        EventRoleType(name) is an exact string lookup
+        (gen/lib/grampstype.py:203): "primary" does not become PRIMARY, it
+        mints a CUSTOM role that keeps the string, and a custom role's
+        is_primary() is False - so the participant vanishes from the Events
+        view's Main Participants column with nothing to show why. A
+        genuinely new spelling still creates a custom role, which is the
+        supported way to get one, but only after failing to match anything
+        already in the list.
+        """
+        cleaned = " ".join(text.split())
+        if not cleaned:
+            return ""
+        folded = cleaned.casefold()
+        for row in self.role_model:
+            known = row[0]
+            if known and known.casefold() == folded:
+                return known
+        return cleaned
+
     def on_role_edited(self, _cell, path, new_text):
-        if not new_text:
+        role = self._canonical_role(new_text or "")
+        if not role:
             return
         row = self.model[path]
         if row[COL_STATE] == STATE_DETACH:
             return
-        row[COL_ROLE] = new_text
+        row[COL_ROLE] = role
         self.update_status()
 
     def on_remove(self, _button):
@@ -953,6 +1871,9 @@ class AddParticipants(Gramplet):
             model.remove(treeiter)
         elif state == STATE_DETACH:
             self._set_state(model[treeiter], STATE_EXISTING)
+            # Putting a family back covers its spouses again, so anyone
+            # staged personally while it was detached has to go.
+            self._drop_covered_staged()
         else:
             self._set_state(model[treeiter], STATE_DETACH)
         self.refresh_completion()
@@ -984,117 +1905,187 @@ class AddParticipants(Gramplet):
             parts.append(_("%d role change(s)") % role_changes)
         if detachments:
             parts.append(_("%d to detach") % detachments)
-        self.status.set_text(", ".join(parts))
+        # A notice is one-shot, and it is shown *alongside* the counts
+        # rather than instead of them: the counts almost always win, and a
+        # notice that only appears when there is nothing pending is a notice
+        # nobody ever reads.
+        notice, self._notice = self._notice, ""
+        summary = ", ".join(parts)
+        if notice and summary:
+            self.status.set_text("%s (%s)" % (notice, summary))
+        else:
+            self.status.set_text(notice or summary)
         self.apply_btn.set_sensitive(bool(parts) and self.event is not None)
 
     # ------------------------------------------------------------------
     # Apply
     # ------------------------------------------------------------------
 
+    def _report(self, message):
+        """Say something that must not be missed.
+
+        The gramplet's own status line, and the main window's status bar
+        (gui/displaystate.py:697) for the case where the gramplet is not the
+        thing being looked at.
+        """
+        self._notice = message
+        self.status.set_text(message)
+        try:
+            self.uistate.push_message(self.dbstate, message)
+        except Exception:
+            LOG.debug("could not push a status message", exc_info=True)
+
     def on_apply(self, _button):
         if self.event is None:
             return
-        additions, detachments, role_changes = self.pending_counts()
-        if not (additions or detachments or role_changes):
+        if not any(self.pending_counts()):
             return
 
         db = self.dbstate.db
         ev_handle = self.event.get_handle()
-        new_sort = self._sort_value(self.event)
+        # Re-read the event: it may have been edited, or deleted, since it
+        # was selected. Its date decides where a new reference is inserted,
+        # and committing references to an event that is gone would leave
+        # every one of them dangling.
+        event = self._get_event(ev_handle)
+        if event is None:
+            self._report(_("That event no longer exists; nothing was changed."))
+            return
+        self.event = event
+        new_sort = self._sort_value(event)
 
         # Snapshot the model before touching the database, grouped by object
         # so each person or family is read, changed and committed exactly
         # once. An object holding two references to the same event produces
-        # two rows, and those are told apart by COL_REFIDX rather than by
+        # two rows, and those are told apart by COL_REFNTH rather than by
         # handle alone.
         by_object = {}
         for row in self.model:
             by_object.setdefault((row[COL_KIND], row[COL_HANDLE]), []).append(
                 (row[COL_ROLE], row[COL_ORIG_ROLE], row[COL_STATE],
-                 row[COL_REFIDX])
+                 row[COL_REFNTH])
             )
 
+        # A family that is staying attached already covers its spouses. The
+        # offer knows that, but a person can still be staged while the family
+        # is detached and then have it put back, so the guard is repeated
+        # here where the writing happens.
+        covered = self._covered_by_family()
+
+        # Counted as they happen rather than read off the model beforehand:
+        # a row whose reference has moved under us is skipped, and saying
+        # "applied" for it would be a lie.
+        added = detached = rerolled = skipped = 0
+        sort_values = {}
+        self._applying = True
         try:
             with DbTxn(_("Edit participants of event"), db) as trans:
                 for (kind, handle), entries in by_object.items():
                     obj = self._get_object(kind, handle)
                     if obj is None:
+                        # Only rows that actually asked for something count
+                        # as skipped; an untouched row was never a change.
+                        skipped += sum(1 for entry in entries
+                                       if _is_staged(entry))
                         continue
 
                     refs = list(obj.get_event_ref_list())
+                    # Where this object's references to *this* event sit now.
+                    # Rows name which of them they mean, so an unrelated
+                    # reference appearing or going elsewhere in the list
+                    # cannot land an edit on the wrong reference.
+                    positions = [index for index, ref in enumerate(refs)
+                                 if ref.ref == ev_handle]
                     changed = False
 
-                    # Roles first: they address a ref by its original index,
-                    # so they must run before a detach shifts the list.
-                    for role, orig_role, state, refidx in entries:
+                    # Roles first: they address a ref by position, so they
+                    # must run before a detach shifts the list.
+                    for role, orig_role, state, nth in entries:
                         if state != STATE_EXISTING or role == orig_role:
                             continue
-                        ref = self._ref_at(refs, refidx, ev_handle)
-                        if ref is not None:
-                            ref.set_role(EventRoleType(role))
+                        if 0 <= nth < len(positions):
+                            refs[positions[nth]].set_role(EventRoleType(role))
+                            rerolled += 1
                             changed = True
+                        else:
+                            skipped += 1
 
-                    # Then detachments, highest index first for the same reason.
-                    for refidx in sorted(
-                        (entry[3] for entry in entries
-                         if entry[2] == STATE_DETACH),
-                        reverse=True,
-                    ):
-                        if self._ref_at(refs, refidx, ev_handle) is not None:
-                            del refs[refidx]
-                            changed = True
+                    # Then detachments, highest position first for the same
+                    # reason.
+                    doomed = []
+                    for _role, _orig, state, nth in entries:
+                        if state != STATE_DETACH:
+                            continue
+                        if 0 <= nth < len(positions):
+                            doomed.append(positions[nth])
+                        else:
+                            skipped += 1
+                    for position in sorted(set(doomed), reverse=True):
+                        del refs[position]
+                        detached += 1
+                        changed = True
 
                     # Additions last, so _insert_index sees the final list.
-                    for role, orig_role, state, refidx in entries:
+                    for role, _orig, state, _nth in entries:
                         if state != STATE_NEW:
                             continue
+                        if kind == "Person" and handle in covered:
+                            # A family reference already stands for them;
+                            # a personal one on top is the double count.
+                            skipped += 1
+                            continue
                         if any(ref.ref == ev_handle for ref in refs):
+                            # Attached from somewhere else in the meantime.
+                            skipped += 1
                             continue
                         eref = EventRef()
                         eref.set_reference_handle(ev_handle)
                         eref.set_role(EventRoleType(role))
-                        refs.insert(self._insert_index(refs, new_sort), eref)
+                        refs.insert(
+                            self._insert_index(refs, new_sort, sort_values),
+                            eref,
+                        )
+                        added += 1
                         changed = True
 
                     if changed:
                         obj.set_event_ref_list(refs)
                         self._commit_object(kind, obj, trans)
+
+                # Touch the event itself, inside the transaction. Nothing
+                # else tells the Events view that its cached Main
+                # Participants column is stale: it watches person-update, but
+                # its handler walks each person's *current* references
+                # (plugins/view/eventview.py:156) and so cannot see one we
+                # just removed. Committing the event here makes the
+                # transaction emit event-update on its own
+                # (plugins/db/dbapi/dbapi.py:356) and, unlike emitting it by
+                # hand afterwards, undo and redo replay it
+                # (gen/db/generic.py:288) - so undoing an addition no longer
+                # leaves the column overstating the count.
+                if added or detached or rerolled:
+                    db.commit_event(event, trans)
         except Exception as err:
             # DbTxn.__exit__ has already aborted the transaction, so the
             # database is untouched. An exception raised from a GTK callback
             # would otherwise reach the user as nothing at all: keep the
             # pending edits on screen and say what went wrong.
             LOG.exception("Add Participants: applying changes failed")
-            message = _("Could not apply changes: %s") % err
-            self.status.set_text(message)
-            self.uistate.push_message(self.dbstate, message)
+            self._report(_("Could not apply changes: %s") % err)
             return
-
-        # The event object itself never changed, so nothing has told the
-        # Events view that its cached Main Participants column is stale.
-        # That view does watch person-update, but its handler walks each
-        # person's *current* event refs (plugins/view/eventview.py:156), so
-        # it cannot see a reference we just removed. Nudge the row directly;
-        # this covers additions, role changes and detachments alike.
-        try:
-            db.emit("event-update", ([ev_handle],))
-        except Exception:
-            LOG.debug("could not emit event-update", exc_info=True)
+        finally:
+            self._applying = False
 
         self.load_participants()
         self.refresh_completion()
         self.update_status()
-        self.status.set_text(
-            _("Applied: +%d, %d role change(s), -%d")
-            % (additions, role_changes, detachments)
-        )
-
-    @staticmethod
-    def _ref_at(refs, refidx, ev_handle):
-        """The ref a row stands for, or None if it no longer lines up."""
-        if 0 <= refidx < len(refs) and refs[refidx].ref == ev_handle:
-            return refs[refidx]
-        return None
+        message = _("Applied: +%(add)d, %(role)d role change(s), -%(detach)d") \
+            % {"add": added, "role": rerolled, "detach": detached}
+        if skipped:
+            message += " " + (
+                _("(%d change(s) no longer matched the record)") % skipped
+            )
+        self.status.set_text(message)
 
     def _get_object(self, kind, handle):
         if kind == "Person":
@@ -1114,15 +2105,24 @@ class AddParticipants(Gramplet):
         date = event.get_date_object()
         return date.get_sort_value() if date else 0
 
-    def _insert_index(self, refs, new_sort):
-        """Chronological position. Undated events keep their place."""
+    def _insert_index(self, refs, new_sort, sort_values=None):
+        """Chronological position. Undated events keep their place.
+
+        `sort_values` memoises the event reads across one apply. Without it
+        every addition re-read every event in that person's list, inside the
+        transaction; sort values are a property of the event, so one cache
+        serves every person in the batch.
+        """
         if not new_sort:
             return len(refs)
+        if sort_values is None:
+            sort_values = {}
         for index, ref in enumerate(refs):
-            event = self._get_event(ref.ref)
-            if event is None:
-                continue
-            sort_value = self._sort_value(event)
+            sort_value = sort_values.get(ref.ref)
+            if sort_value is None:
+                event = self._get_event(ref.ref)
+                sort_value = self._sort_value(event) if event is not None else 0
+                sort_values[ref.ref] = sort_value
             if sort_value and sort_value > new_sort:
                 return index
         return len(refs)
