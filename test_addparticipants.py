@@ -246,6 +246,7 @@ class Ev:
     def __init__(self,s,year=0,calendar=0,etype=EventType.BIRTH):
         self._s=s; self._y=year; self._c=calendar; self._t=etype
     def get_type(self): return EventType(self._t)
+    def get_description(self): return ""
     def get_date_object(self):
         date=Date()
         date.set(calendar=self._c, value=(0,0,self._y,False))
@@ -375,7 +376,8 @@ def make():
         "set_text": lambda s,t: setattr(g,"typed",t)})()
     g._index_id=0; g._index_iter=None; g._index_spouses={}
     g._completion_excluded=frozenset(); g._matches=[]; g.typed=""
-    g._index_lifespan={}; g._not_living=0
+    g._index_lifespan={}; g._index_forms={}
+    g._not_living=0; g._already_listed=0
     g._index_years={}; g._index_fallbacks={}; g._index_mothers={}
     g._rebuild_id=0; g._applying=False; g._notice=""
     g.event=None; g.event_handle=None
@@ -1291,6 +1293,95 @@ check("both detachments were undone: %r"
       % [r[ap.COL_STATE] for r in g.model],
       all(r[ap.COL_STATE]==ap.STATE_EXISTING for r in g.model))
 check("and no third row was invented (%d)" % len(g.model), len(g.model)==2)
+
+print("\n[AM] Enter says something true about why nothing was staged")
+g,db=make()
+db.events["b1"]=Ev(0,1900); db.events["d1"]=Ev(0,1980)
+db.people["p1"]=Person("x", names=[Name("Amy","Smith")],
+                       b="b1", d="d1", refs=[Ref("b1"),Ref("d1")])
+db.people["p2"]=Person("x", names=[Name("Amy Jane","Smithson")])
+g.build_people_cache(); drain(g)
+g.refresh_completion()
+g.stage_person=lambda l,h: setattr(g,"staged",(l,h)); g.staged=None
+
+def enter(typed):
+    g.staged=None; g.last_status=None
+    g.on_entry_activate(type("E",(),{"get_text":lambda s:typed,
+                                     "set_text":lambda s,t:None})())
+
+# (a) the exact-match test used to compare the typed text against the
+# decorated label, so anyone with dates could never be an exact match
+enter("Amy Smith")
+check("a full name picks its owner out of the partial matches: %r"
+      % (g.staged,), g.staged is not None and g.staged[1]=="p1")
+enter("Smith")
+check("a bare surname is still ambiguous: %r" % g.last_status,
+      g.staged is None and "2 people match" in str(g.last_status))
+
+# (b) a search that only turns up people already listed says so
+g,db=make()
+db.people["p1"]=Person("x", names=[Name("Amy","Smith")])
+g.build_people_cache(); drain(g)
+g.model.append(row("Smith, Amy","Primary",ap.STATE_EXISTING,
+                   "p1","Person","Primary",0))
+g.refresh_completion()
+g.stage_person=lambda l,h: setattr(g,"staged",(l,h)); g.staged=None
+enter("Amy Smith")
+check("nothing is staged", g.staged is None)
+check("and it does not claim there is no such person: %r" % g.last_status,
+      "already a participant" in str(g.last_status))
+
+# (c) an Enter during the index build says the index is still filling
+g,db=make()
+for i in range(300):
+    db.people["p%d"%i]=Person("x", names=[Name("G%d"%i,"S%d"%i)])
+g.build_people_cache()                       # started, not finished
+g.stage_person=lambda l,h: setattr(g,"staged",(l,h)); g.staged=None
+enter("G299 S299")
+check("it says the index is still filling: %r" % g.last_status,
+      "indexing" in str(g.last_status).lower())
+drain(g)
+enter("G299 S299")
+check("...and once it is done the same text stages the person: %r"
+      % (g.staged,), g.staged is not None and g.staged[1]=="p299")
+
+print("\n[AN] moving to another event says what it discarded")
+g,db=make()
+db.events["E1"]=Ev(500,1900); db.events["E2"]=Ev(600,1910)
+g.get_active=lambda t:"E2"
+g.header=type("H",(),{"set_markup":lambda s,m:None})()
+g.load_participants=lambda: g.model.clear()
+g.refresh_completion=lambda force=False:None
+g.event_handle="E1"
+g.model.append(row("Ann","Primary",ap.STATE_NEW,"p1","Person","",-1))
+g.model.append(row("Bea","Witness",ap.STATE_DETACH,"p2","Person","Primary",0))
+g.main()
+check("the new event is loaded", g.event_handle=="E2")
+check("the staged edits are gone (%d rows)" % len(g.model), len(g.model)==0)
+check("but they were not thrown away in silence: %r" % g.last_status,
+      "Discarded 2" in str(g.last_status))
+
+# deselecting the event entirely says it too
+g,db=make()
+g.get_active=lambda t:None
+g.header=type("H",(),{"set_markup":lambda s,m:None})()
+g.event_handle="E1"
+g.model.append(row("Ann","Primary",ap.STATE_NEW,"p1","Person","",-1))
+g.main()
+check("deselecting reports it as well: %r" % g.last_status,
+      "Discarded 1" in str(g.last_status))
+
+# and an event with nothing staged says nothing
+g,db=make()
+db.events["E2"]=Ev(600,1910)
+g.get_active=lambda t:"E2"
+g.header=type("H",(),{"set_markup":lambda s,m:None})()
+g.load_participants=lambda:None
+g.refresh_completion=lambda force=False:None
+g.event_handle="E1"
+g.main()
+check("nothing staged, nothing said: %r" % g.last_status,
+      not str(g.last_status or ""))
 
 print("\n[AB] a change that lands during the index build is not clobbered")
 # The raw build walks a snapshot of the table taken at build_people_cache time.

@@ -196,6 +196,20 @@ def _raw_year(date_data):
         return year
 
 
+def _form_keys(forms):
+    """Whole-name forms reduced to word sets, for the Enter-key test.
+
+    A set of words rather than a string: the display format is "Surname,
+    Given" and nobody types a name that way round.
+    """
+    keys = set()
+    for form in forms:
+        words = frozenset(_fold(form).split())
+        if words:
+            keys.add(words)
+    return frozenset(keys)
+
+
 def _fold(text):
     """Reduce text to lowercase, unaccented, space-separated words.
 
@@ -231,7 +245,9 @@ class AddParticipants(Gramplet):
         self._index_spouses = {}    # person handle -> spouse surnames
         self._index_mothers = {}    # family handle -> its wife's handle
         self._index_lifespan = {}   # person handle -> (birth year, death year)
+        self._index_forms = {}      # person handle -> whole-name word sets
         self._not_living = 0        # left out of the last search by date
+        self._already_listed = 0    # left out of the last search as listed
         self._rebuild_id = 0        # idle source coalescing bulk rebuilds
         self._applying = False      # inside our own apply transaction
         self._notice = ""           # one-shot message for the status label
@@ -548,6 +564,7 @@ class AddParticipants(Gramplet):
             self.people_labels.pop(handle, None)
             if handle in removed_set:
                 self._index_lifespan.pop(handle, None)
+                self._index_forms.pop(handle, None)
                 continue
             person = person_at(handle)
             if person is not None:
@@ -638,6 +655,7 @@ class AddParticipants(Gramplet):
         db = self.dbstate.db
         self.people_labels = {}
         self._index_lifespan = {}
+        self._index_forms = {}
         self._index_mothers = {}
         self._index_touched = set()
         self._sort_people_cache()
@@ -937,15 +955,23 @@ class AddParticipants(Gramplet):
         return self._decorate(name, others, years)
 
     def _raw_person_search_text(self, data, label):
-        """The object path's _person_search_text, from stored data."""
+        """The object path's _person_search_text, from stored data.
+
+        Records this person's whole-name forms in _index_forms on the way
+        past, the same as its twin does.
+        """
         parts = [label]
+        forms = []
         for name_data in [data["primary_name"]] + list(data["alternate_names"]):
-            parts.append(name_displayer.raw_display_name(name_data))
+            display = name_displayer.raw_display_name(name_data)
+            forms.append(display)
+            parts.append(display)
             parts.append(name_data["first_name"])
             parts.append(_raw_surname(name_data))
             parts.append(name_data["call"])
             parts.append(name_data["nick"])
         parts.extend(self._index_spouses.get(data["handle"], ()))
+        self._index_forms[data["handle"]] = _form_keys(forms)
         return _fold(" ".join(part for part in parts if part))
 
     def _show_index_progress(self, done):
@@ -995,15 +1021,23 @@ class AddParticipants(Gramplet):
         A married name is an *alternate* name, so searching only the primary
         name never finds it. This walks [primary] + alternates, the same
         idiom the rest of Gramps uses.
+
+        Records this person's whole-name forms in _index_forms on the way
+        past: that is what the Enter key compares typed text against, and
+        the forms are already in hand here.
         """
         parts = [label]
+        forms = []
         for name in [person.get_primary_name()] + person.get_alternate_names():
-            parts.append(name_displayer.display_name(name))
+            display = name_displayer.display_name(name)
+            forms.append(display)
+            parts.append(display)
             parts.append(name.get_first_name())
             parts.append(name.get_surname())
             parts.append(name.get_call_name())
             parts.append(name.get_nick_name())
         parts.extend(self._index_spouses.get(person.get_handle(), ()))
+        self._index_forms[person.get_handle()] = _form_keys(forms)
         return _fold(" ".join(part for part in parts if part))
 
     def _ref_year(self, ref):
@@ -1097,6 +1131,8 @@ class AddParticipants(Gramplet):
         self.event = self._get_event(handle) if handle else None
 
         if self.event is None:
+            if self.event_handle is not None:
+                self._warn_discarded()
             self.event_handle = None
             self.model.clear()
             self.completion_model.clear()
@@ -1107,6 +1143,8 @@ class AddParticipants(Gramplet):
         # Only rebuild when the event actually changed, so pending edits
         # survive an incidental refresh.
         if handle != self.event_handle:
+            if self.event_handle is not None:
+                self._warn_discarded()
             self.event_handle = handle
             self.load_participants()
 
@@ -1122,6 +1160,22 @@ class AddParticipants(Gramplet):
 
         self.refresh_completion()
         self.update_status()
+
+    def _warn_discarded(self):
+        """Say so when moving to another event throws staged edits away.
+
+        Not a dialog: this runs from the history's active-changed handler,
+        where re-entering the main loop is not safe. A message in both
+        places the user might be looking is enough to stop a batch of edits
+        vanishing without a word.
+        """
+        pending = sum(self.pending_counts())
+        if not pending:
+            return
+        self._report(
+            _("Discarded %d pending change(s) on the previous event")
+            % pending
+        )
 
     def load_participants(self):
         """Populate the list from everything referencing this event."""
@@ -1259,12 +1313,16 @@ class AddParticipants(Gramplet):
             return []
         event_year = self._event_year()
         self._not_living = 0
+        self._already_listed = 0
         scored = []
         for label, handle, search in self.people_cache:
-            if handle in self._completion_excluded:
-                continue
-            # Cheap reject first; only survivors are worth scoring.
+            # Cheap reject first; only survivors are worth scoring. The two
+            # reasons a match is then dropped are counted, so that a search
+            # coming back empty can say which one emptied it.
             if not all(token in search for token in tokens):
+                continue
+            if handle in self._completion_excluded:
+                self._already_listed += 1
                 continue
             if event_year and self._alive_at(handle, event_year) is False:
                 self._not_living += 1
@@ -1320,24 +1378,49 @@ class AddParticipants(Gramplet):
         if not text:
             return
         matches = self._ranked_matches(text)
-        exact = [row for row in matches if _fold(row[0]) == _fold(text)]
+        # An exact hit on one of a person's own name forms wins outright.
+        # Compared against the name, not the label: the label carries years
+        # and bracketed annotations, so anyone with a date could never be an
+        # exact match at all, and it insisted on surname-first order, which
+        # is not how anybody types.
+        typed = frozenset(_fold(text).split())
+        exact = [row for row in matches
+                 if typed in self._index_forms.get(row[1], ())]
         if exact:
             matches = exact
         if len(matches) == 1:
             self.stage_person(matches[0][0], matches[0][1])
             entry.set_text("")
-        elif not matches and self._not_living:
-            self.status.set_text(
-                _("No match for '%(text)s' (%(count)d not living then)")
-                % {"text": text, "count": self._not_living}
-            )
-        elif not matches:
-            self.status.set_text(_("No match for '%s'") % text)
-        else:
+            return
+        if matches:
             self.status.set_text(
                 _("%(count)d people match '%(text)s'")
                 % {"count": len(matches), "text": text}
             )
+            return
+        if self._index_id:
+            # Nothing matches yet because most of the tree is not in the
+            # index yet, which reads as a broken search otherwise.
+            self.status.set_text(
+                _("Still indexing names - try '%s' again in a moment") % text
+            )
+            return
+        # An empty result that something filtered has to say so, or the
+        # person who was filtered out reads as a search that does not work.
+        reasons = []
+        if self._already_listed:
+            reasons.append(
+                _("%d already a participant") % self._already_listed
+            )
+        if self._not_living:
+            reasons.append(_("%d not living then") % self._not_living)
+        if reasons:
+            self.status.set_text(
+                _("No match for '%(text)s' (%(reasons)s)")
+                % {"text": text, "reasons": ", ".join(reasons)}
+            )
+        else:
+            self.status.set_text(_("No match for '%s'") % text)
 
     def stage_person(self, label, handle):
         # Always take the indexed label rather than whatever was displayed,
