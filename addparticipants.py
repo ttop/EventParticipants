@@ -474,31 +474,79 @@ class AddParticipants(Gramplet):
     def _index_chunk(self):
         """Absorb one slice of people, then yield back to the main loop."""
         if self._index_iter is None:
-            self._index_id = 0
+            self._finish_index()
             return False
         absorbed = 0
-        for item in self._index_iter:
-            if self._index_raw:
-                # A concurrent add/update/delete owns this row now; the
-                # pre-captured snapshot is stale for it, so leave it alone
-                # rather than clobbering the fresher value (or re-adding a
-                # person who was deleted).
-                if item["handle"] not in self._index_touched:
-                    self.people_labels[item["handle"]] = self._raw_person_entry(item)
-            else:
-                person = self._get_person(item)
-                if person is not None:
-                    self.people_labels[item] = self._person_entry(person)
-            absorbed += 1
-            if absorbed >= INDEX_CHUNK:
-                self._show_index_progress(done=False)
-                return True
-        # Exhausted: publish the finished index.
+        try:
+            for item in self._index_iter:
+                self._index_one(item)
+                absorbed += 1
+                if absorbed >= INDEX_CHUNK:
+                    self._show_index_progress(done=False)
+                    return True
+        except Exception:
+            # Anything that escapes here takes the idle source with it:
+            # PyGObject drops the callback, _index_id stays set, the search
+            # box sits on "Indexing names..." for the rest of the session and
+            # the sorted index is never published. Publish what there is.
+            LOG.exception(
+                "Add Participants: indexing stopped early; "
+                "the name index may be incomplete"
+            )
+        self._finish_index()
+        return False
+
+    def _finish_index(self):
+        """Publish the index and clear the idle bookkeeping.
+
+        Every exit from _index_chunk comes through here, successful or not:
+        leaving _index_id set once the idle source is gone is what strands
+        the placeholder and the completion.
+        """
         self._index_id = 0
         self._index_iter = None
         self._sort_people_cache()
         self._show_index_progress(done=True)
-        return False
+
+    def _index_one(self, item):
+        """Absorb one person, degrading a bad raw row to the object API.
+
+        build_people_cache() proves the raw layout on the first row only, so
+        a row further in that does not fit is the first sign the stored shape
+        is not what this expects. Read that one person as an object rather
+        than losing the rest of the build.
+        """
+        if not self._index_raw:
+            self._index_person_object(item)
+            return
+        handle = None
+        try:
+            handle = item["handle"]
+            # A concurrent add/update/delete owns this row now; the
+            # pre-captured snapshot is stale for it, so leave it alone
+            # rather than clobbering the fresher value (or re-adding a
+            # person who was deleted).
+            if handle in self._index_touched:
+                return
+            self.people_labels[handle] = self._raw_person_entry(item)
+        except Exception:
+            LOG.debug("raw row unusable; reading %s as an object", handle,
+                      exc_info=True)
+            if handle and handle not in self._index_touched:
+                self._index_person_object(handle)
+
+    def _index_person_object(self, handle):
+        """Index one person through the object API, or skip them.
+
+        A person nothing can read is left out of the offer rather than
+        stopping everyone else from being indexed.
+        """
+        try:
+            person = self._get_person(handle)
+            if person is not None:
+                self.people_labels[handle] = self._person_entry(person)
+        except Exception:
+            LOG.debug("could not index person %s", handle, exc_info=True)
 
     def _build_year_map(self, db):
         """Event handle -> year, for every dated event, in a single query."""

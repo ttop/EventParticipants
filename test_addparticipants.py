@@ -643,6 +643,53 @@ check("fell back to the object API", g._index_raw is False)
 check("and still indexed the person (%d)" % len(g.people_labels),
       len(g.people_labels)==1)
 
+print("\n[T2] one unusable row does not strand the whole index")
+# build_people_cache() only proves the raw layout on the first row. A bad
+# row further in used to raise inside the GLib idle callback, which kills
+# the idle source: _index_id stayed set, "Indexing names..." stuck forever
+# and the sorted index was never published.
+g,db=make()
+for i in range(3):
+    db.people["p%d"%i]=Person("x", names=[Name("G%d"%i,"S%d"%i)])
+_good=db.get_person_cursor
+def _mixed():
+    rows=[]
+    for _h,d in _good():
+        d=dict(d)
+        # Unreadable, but only once _raw_person_entry gets to it: the probe
+        # in build_people_cache never sees this row.
+        if d["handle"]=="p1": d["alternate_names"]=None
+        rows.append(d)
+    return _Cursor(rows)
+db.get_person_cursor=_mixed
+g.build_people_cache(); drain(g)
+check("the build finished instead of hanging", g._index_id==0)
+check("the placeholder stopped saying 'Indexing': %r" % g.placeholder,
+      "Indexing" not in str(g.placeholder))
+check("everyone is indexed (%d of 3)" % len(g.people_labels),
+      len(g.people_labels)==3)
+check("...including the row that could not be read raw: %r"
+      % (g.people_labels.get("p1"),),
+      "S1" in (g.people_labels.get("p1") or ("",))[0])
+check("and the sorted index was published (%d)" % len(g.people_cache),
+      len(g.people_cache)==3)
+
+# the object path is guarded too: an unreadable person is skipped, not fatal
+g,db=make()
+db.people["ok"]=Person("x", names=[Name("Ann","Lee")])
+db.people["bad"]=Person("x", names=[Name("Bad","Row")])
+def _boom(): raise RuntimeError("no cursor here")
+db.get_person_cursor=_boom
+_real=g._person_entry
+def _entry(person):
+    if person is db.people["bad"]: raise RuntimeError("unreadable person")
+    return _real(person)
+g._person_entry=_entry
+g.build_people_cache(); drain(g)
+check("only the unreadable person was skipped (%d of 2)"
+      % len(g.people_labels), len(g.people_labels)==1)
+check("the build still published", g._index_id==0 and len(g.people_cache)==1)
+
 print("\n[U] a surname reached by marriage is searchable")
 # Louisa Heitt married Ernest Reyman. Her record carries no married name -
 # that is how nearly every tree stores it - so "Louisa Reyman" has to be
