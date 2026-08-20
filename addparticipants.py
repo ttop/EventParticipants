@@ -79,6 +79,12 @@ COMPLETION_LIMIT = 40
 # unknown is never held against anyone.
 MAX_LIFESPAN = 100   # years
 DEATH_GRACE = 2      # burials, probate and the like follow a death
+# A christening follows a birth the same way round, so when the birth year
+# is really a christening year it is a lower bound that sits slightly too
+# late: without this, someone christened in 1842 is ruled out of an 1841
+# census. Adult baptism is not covered by two years and never will be - the
+# stock way of attaching a person to an event is there for that.
+BIRTH_GRACE = 2      # christenings and baptisms follow a birth
 
 STATE_EXISTING = ""
 STATE_NEW = "new"
@@ -1011,22 +1017,31 @@ class AddParticipants(Gramplet):
         return label
 
     def _raw_person_years(self, data):
-        """(birth year, death year) from stored data, via the year map.
+        """(birth year, death year, birth grace) from stored data.
 
         Plenty of people have no birth event at all, only a christening, and
         no death event, only a burial. Reading nothing but
         birth_ref_index/death_ref_index left them with no years in the label
         and nothing for _alive_at() to exclude them by - a filter that fires
         on more people, not fewer, which is the point of it.
+
+        What is wanted here is a *year*, not an event, so an undated birth
+        or death event does not block a dated fallback from supplying one.
+        That is a deliberate departure from get_birth_or_fallback(), which
+        stops at the first primary reference whether it carries a date or
+        not. The third value is the grace _alive_at() must allow on the
+        lower bound, non-zero exactly when the birth year is really a
+        christening year.
         """
         refs = data["event_ref_list"]
         years = [0, 0]
         found = [False, False]
+        grace = 0
         for slot, key in enumerate(("birth_ref_index", "death_ref_index")):
             index = data[key]
             if index is not None and 0 <= index < len(refs):
                 years[slot] = self._index_years.get(refs[index]["ref"], 0)
-                found[slot] = True
+                found[slot] = bool(years[slot])
         if not all(found):
             for ref in refs:
                 if all(found):
@@ -1036,16 +1051,20 @@ class AddParticipants(Gramplet):
                 value = self._index_fallbacks.get(ref["ref"])
                 if value is None:
                     continue
+                year = self._index_years.get(ref["ref"], 0)
+                if not year:
+                    continue
                 # A stillbirth stands in for both, so neither test excludes
                 # the other - the same as get_birth_or_fallback() and
                 # get_death_or_fallback() run independently.
                 if not found[0] and value in BIRTH_FALLBACKS:
-                    years[0] = self._index_years.get(ref["ref"], 0)
+                    years[0] = year
                     found[0] = True
+                    grace = BIRTH_GRACE
                 if not found[1] and value in DEATH_FALLBACKS:
-                    years[1] = self._index_years.get(ref["ref"], 0)
+                    years[1] = year
                     found[1] = True
-        return tuple(years)
+        return (years[0], years[1], grace)
 
     def _raw_person_entry(self, data):
         """(label, folded search text) straight from stored person data."""
@@ -1167,19 +1186,21 @@ class AddParticipants(Gramplet):
         return _gregorian_year(event.get_date_object())
 
     def _person_years(self, person):
-        """(birth year, death year) in the Gregorian calendar, 0 for unknown.
+        """(birth year, death year, birth grace), 0 for unknown.
 
         The object-path twin of _raw_person_years: a christening stands in
         for a missing birth and a burial for a missing death, the same
-        substitutes gen/utils/db.py:53 accepts.
+        substitutes gen/utils/db.py:53 accepts, and an undated primary event
+        does not block a dated fallback.
         """
         years = [0, 0]
         found = [False, False]
+        grace = 0
         for slot, ref in enumerate((person.get_birth_ref(),
                                     person.get_death_ref())):
             if ref:
                 years[slot] = self._ref_year(ref)
-                found[slot] = True
+                found[slot] = bool(years[slot])
         if not all(found):
             for ref in person.get_primary_event_ref_list():
                 if all(found):
@@ -1187,14 +1208,18 @@ class AddParticipants(Gramplet):
                 event = self._get_event(ref.ref)
                 if event is None:
                     continue
+                year = _gregorian_year(event.get_date_object())
+                if not year:
+                    continue
                 etype = event.get_type()
                 if not found[0] and etype.is_birth_fallback():
-                    years[0] = _gregorian_year(event.get_date_object())
+                    years[0] = year
                     found[0] = True
+                    grace = BIRTH_GRACE
                 if not found[1] and etype.is_death_fallback():
-                    years[1] = _gregorian_year(event.get_date_object())
+                    years[1] = year
                     found[1] = True
-        return tuple(years)
+        return (years[0], years[1], grace)
 
     def _person_entry(self, person):
         """(display label, folded search text) for one person."""
@@ -1404,11 +1429,15 @@ class AddParticipants(Gramplet):
         Only a wholly undated person is unknown. One date is enough to infer
         the other to within MAX_LIFESPAN, which is what makes this worth
         anything: most people here have a birth year and no death year.
+
+        `birth_grace` is BIRTH_GRACE when the birth year is really a
+        christening year, and 0 when it is a birth - the mirror of
+        DEATH_GRACE on the other end.
         """
-        birth, death = self._index_lifespan.get(handle, (0, 0))
+        birth, death, birth_grace = self._index_lifespan.get(handle, (0, 0, 0))
         if not birth and not death:
             return None
-        if birth and year < birth:
+        if birth and year < birth - birth_grace:
             return False
         if death and year > death + DEATH_GRACE:
             return False

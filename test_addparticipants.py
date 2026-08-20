@@ -1120,7 +1120,7 @@ for _force in (False, True):
           "1840" in g.people_labels["p1"][0]
           and "1890" in g.people_labels["p1"][0])
     check("%s: and the lifespan: %r" % (path, g._index_lifespan["p1"]),
-          g._index_lifespan["p1"]==(1840,1890))
+          g._index_lifespan["p1"]==(1840,1890,ap.BIRTH_GRACE))
     check("%s: so a 1990 event rules her out" % path,
           g._alive_at("p1",1990) is False)
     check("%s: and an 1860 one does not" % path,
@@ -1128,6 +1128,69 @@ for _force in (False, True):
 check("both paths produce the same entry",
       fallback_tree(False).people_labels["p1"]
       == fallback_tree(True).people_labels["p1"])
+check("both paths agree on the grace too",
+      fallback_tree(False)._index_lifespan["p1"]
+      == fallback_tree(True)._index_lifespan["p1"])
+
+# a christening follows a birth, so it is a lower bound set slightly late
+for _force in (False, True):
+    g,db=make(); path="object" if _force else "raw"
+    db.events["chr"]=Ev(0,1842,etype=EventType.CHRISTEN)
+    db.people["p1"]=Person("x", names=[Name("Ada","Stone")], refs=[Ref("chr")])
+    if _force:
+        def boom(): raise RuntimeError("no cursor here")
+        db.get_person_cursor=boom
+    g.build_people_cache(); drain(g)
+    check("%s: an 1841 census does not rule out a child christened in 1842"
+          % path, g._alive_at("p1",1841) is True)
+    check("%s: ...but 1830 still does" % path,
+          g._alive_at("p1",1830) is False)
+    check("%s: the grace is recorded, not baked into the year: %r"
+          % (path, g._index_lifespan["p1"]),
+          g._index_lifespan["p1"]==(1842,0,ap.BIRTH_GRACE))
+    check("%s: and the label shows the real christening year: %r"
+          % (path, g.people_labels["p1"][0]),
+          "1842" in g.people_labels["p1"][0])
+
+# a real birth year gets no grace at all - that would be hedging
+for _force in (False, True):
+    g,db=make(); path="object" if _force else "raw"
+    db.events["b1"]=Ev(0,1842,etype=EventType.BIRTH)
+    db.people["p1"]=Person("x", names=[Name("Ada","Stone")],
+                           b="b1", refs=[Ref("b1")])
+    if _force:
+        def boom(): raise RuntimeError("no cursor here")
+        db.get_person_cursor=boom
+    g.build_people_cache(); drain(g)
+    check("%s: a recorded 1842 birth still rules out 1841" % path,
+          g._alive_at("p1",1841) is False)
+    check("%s: and carries no grace: %r" % (path, g._index_lifespan["p1"]),
+          g._index_lifespan["p1"]==(1842,0,0))
+
+# an undated primary event is no use as a year, so it must not block a
+# dated fallback from supplying one
+for _force in (False, True):
+    g,db=make(); path="object" if _force else "raw"
+    db.events["b1"]=Ev(0,0,etype=EventType.BIRTH)          # birth, no date
+    db.events["chr"]=Ev(0,1842,etype=EventType.CHRISTEN)
+    db.events["d1"]=Ev(0,0,etype=EventType.DEATH)          # death, no date
+    db.events["bur"]=Ev(0,1900,etype=EventType.BURIAL)
+    db.people["p1"]=Person("x", names=[Name("Ada","Stone")],
+                           b="b1", d="d1",
+                           refs=[Ref("b1"),Ref("chr"),Ref("d1"),Ref("bur")])
+    if _force:
+        def boom(): raise RuntimeError("no cursor here")
+        db.get_person_cursor=boom
+    g.build_people_cache(); drain(g)
+    check("%s: the dated christening and burial won through: %r"
+          % (path, g._index_lifespan["p1"]),
+          g._index_lifespan["p1"]==(1842,1900,ap.BIRTH_GRACE))
+    check("%s: so the years reach the label: %r"
+          % (path, g.people_labels["p1"][0]),
+          "1842" in g.people_labels["p1"][0]
+          and "1900" in g.people_labels["p1"][0])
+    check("%s: and a 1990 event rules her out" % path,
+          g._alive_at("p1",1990) is False)
 
 # a witness at someone else's burial has not died
 for _force in (False, True):
@@ -1141,7 +1204,7 @@ for _force in (False, True):
     g.build_people_cache(); drain(g)
     check("%s: a non-primary role is not a fallback: %r"
           % (path, g._index_lifespan["p1"]),
-          g._index_lifespan["p1"]==(0,0))
+          g._index_lifespan["p1"]==(0,0,0))
     check("%s: so she is never ruled out" % path,
           g._alive_at("p1",1990) is None)
 
@@ -1160,7 +1223,7 @@ check("the year map followed the edit (%r)" % g._index_years.get("b1"),
 check("so did the label: %r" % g.people_labels["p1"][0],
       "1860" in g.people_labels["p1"][0])
 check("and the lifespan the alive filter reads: %r" % (g._index_lifespan["p1"],),
-      g._index_lifespan["p1"]==(1860,0))
+      g._index_lifespan["p1"]==(1860,0,0))
 
 # the selected event's own date moving refreshes the view
 g,db=make()

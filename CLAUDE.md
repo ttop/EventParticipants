@@ -262,6 +262,18 @@ rather than calling the db directly.
   only `birth_ref_index`/`death_ref_index` gave christening-only people a
   lifespan of `(0, 0)`, which reads as "no dates at all" and never excludes.
   This makes the filter fire on more people, not fewer.
+  Two deliberate departures from `get_birth_or_fallback()`:
+  **an undated primary event does not block a dated fallback** (that function
+  stops at the first primary reference, dated or not; what is wanted here is
+  a *year*, so an undated Birth must not shut out a dated Christening), and
+  **`BIRTH_GRACE` mirrors `DEATH_GRACE` on the lower bound** when the birth
+  year is really a christening year. A christening follows a birth exactly as
+  a burial follows a death, so without it someone christened in 1842 was ruled
+  out of an 1841 census. It is applied *only* to a fallback-derived year — a
+  recorded birth year gets no grace, because that would be hedging. Two years
+  does not cover adult baptism and is not meant to; the stock way of attaching
+  a person to an event is there for that. `_index_lifespan` therefore stores
+  `(birth, death, birth_grace)`.
   Years are converted to the **Gregorian** calendar first
   (`_gregorian_year` / `_raw_year`): both a raw `dateval` and
   `Date.get_year()` answer in the date's own calendar, so one Hebrew-calendar
