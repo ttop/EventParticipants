@@ -177,8 +177,16 @@ class DbTxn:
 
 _mod("gramps"); _mod("gramps.gen")
 _mod("gramps.gen.plug", Gramplet=type("Gramplet",(),{}))
+def gregorian(date):
+    """gramps.gen.lib.date.gregorian: convert without touching the original."""
+    if date.get_calendar() != Date.CAL_GREGORIAN:
+        date = Date(date)
+        date.convert_calendar(Date.CAL_GREGORIAN)
+    return date
+
 _mod("gramps.gen.lib", Date=Date, EventRef=EventRef,
      EventRoleType=EventRoleType, EventType=EventType)
+_mod("gramps.gen.lib.date", Date=Date, gregorian=gregorian)
 _mod("gramps.gen.db", DbTxn=DbTxn)
 def _format_surnames(parts):
     """SurnameBase.get_surname() over (surname, prefix, connector) triples.
@@ -313,7 +321,7 @@ class FakeDb:
     here so that cannot happen again.
     """
     def __init__(self):
-        self.people={}; self.events={}; self.families={}; self.emitted=[]
+        self.people={}; self.events={}; self.families={}
         self.committed_events=[]
     def _ref_index(self, person, handle):
         for i,r in enumerate(person.refs):
@@ -360,7 +368,6 @@ class FakeDb:
                     yield ("Family", h)
     def commit_event(self, event, trans, change_time=None):
         self.committed_events.append(event)
-    def emit(self, signal, args): self.emitted.append((signal, args))
     def get_person_handles(self, sort_handles=False): return list(self.people)
     def is_open(self): return True
     def iter_people(self):
@@ -396,6 +403,7 @@ def make():
     g._not_living=0; g._already_listed=0
     g._index_years={}; g._index_fallbacks={}; g._index_mothers={}
     g._rebuild_id=0; g._applying=False; g._notice=""; g._family_spouses={}
+    g._recache_pending=set(); g._recache_id=0
     g.event=None; g.event_handle=None
     g.last_status=None; g.placeholder=None
     g.updates=0
@@ -1583,6 +1591,87 @@ check("the 'changed elsewhere' notice survives to the label: %r" % g.last_status
       "changed elsewhere" in str(g.last_status)
       and "1 to add" in str(g.last_status))
 
+print("\n[AN3] a big re-cache goes onto idle turns, not the signal handler")
+# Correcting a shared event's date names every participant. A census with
+# hundreds of them costs a read each plus their birth, death and family
+# reads - the query-per-person freeze the raw index exists to avoid.
+g,db=make()
+db.events["E1"]=Ev(0,1900)
+count=ap.RECACHE_CHUNK*2+5
+for i in range(count):
+    db.people["p%d"%i]=Person("x", names=[Name("G%d"%i,"Census")],
+                              b="E1", refs=[Ref("E1")])
+g.build_people_cache(); drain(g)
+reads=[]
+_orig=db.get_person_from_handle
+db.get_person_from_handle=lambda h:(reads.append(h), _orig(h))[1]
+db.events["E1"]=Ev(0,1910)                       # the date was corrected
+g.on_events_changed(["E1"])
+check("the handler returned without reading anybody (%d reads)" % len(reads),
+      reads==[])
+check("...having queued them all instead (%d of %d)"
+      % (len(g._recache_pending), count), len(g._recache_pending)==count)
+turns=0
+while g._recache_id and turns<100:
+    cb=GLib._sources.get(g._recache_id)
+    if cb is None: break
+    turns+=1
+    if not cb(): break
+check("it took several idle turns (%d)" % turns, turns>1)
+check("every label caught up: %r" % g.people_labels["p0"][0],
+      all("1910" in g.people_labels["p%d"%i][0] for i in range(count)))
+check("and the queue is empty", not g._recache_pending and g._recache_id==0)
+
+# a small batch is still done there and then, as it always was
+g,db=make()
+db.events["E1"]=Ev(0,1900)
+db.people["p1"]=Person("x", names=[Name("Ann","Lee")], b="E1", refs=[Ref("E1")])
+g.build_people_cache(); drain(g)
+db.events["E1"]=Ev(0,1910)
+g.on_events_changed(["E1"])
+check("one participant is re-cached immediately: %r" % g.people_labels["p1"][0],
+      "1910" in g.people_labels["p1"][0])
+
+print("\n[AN4] one corrupt record does not abandon the rest of a batch")
+# Callback.emit swallows an exception from a signal handler with nothing but
+# a log line (gen/utils/callback.py:427), so a handler that dies half way
+# leaves stale labels with no sign at all.
+g,db=make()
+db.people["good1"]=Person("x", names=[Name("Ann","Lee")])
+db.people["bad"]=Person("x", names=[Name("Bad","Row")])
+db.people["good2"]=Person("x", names=[Name("Zoe","Vale")])
+g.build_people_cache(); drain(g)
+db.people["good1"]=Person("x", names=[Name("Anne","Leigh")])
+db.people["good2"]=Person("x", names=[Name("Zoey","Vail")])
+_real=g._person_entry
+def _entry(person):
+    if person is db.people["bad"]: raise RuntimeError("corrupt record")
+    return _real(person)
+g._person_entry=_entry
+try:
+    g.on_people_changed(["good1","bad","good2"])
+    survived=True
+except Exception as exc:
+    survived=False
+check("the handler did not blow up (%r)" % (survived,), survived)
+check("the people either side of the bad one were re-cached: %r"
+      % [g.people_labels[h][0] for h in ("good1","good2")],
+      "Leigh" in g.people_labels["good1"][0]
+      and "Vail" in g.people_labels["good2"][0])
+
+# and a family nothing can read is skipped, not fatal
+g,db=make()
+db.people["wife"]=Person("x", names=[Name("Louisa","Heitt")], families=["f1"])
+g.build_people_cache(); drain(g)
+def _boom_family(h): raise RuntimeError("corrupt family")
+g._get_family=_boom_family
+try:
+    g.on_people_changed(["wife"])
+    survived=True
+except Exception as exc:
+    survived=False
+check("an unreadable family is survivable (%r)" % (survived,), survived)
+
 print("\n[AN2] a queued bulk rebuild does not outlive its tree")
 g,db=make()
 db.people["p1"]=Person("x", names=[Name("Ann","Lee")])
@@ -1748,6 +1837,21 @@ db.families["f1"]=Family(father="hus", mother="wife")
 g.build_people_cache(); drain(g)
 check("the build itself gave her his surname: %r" % g.people_labels["wife"][0],
       "m. Reyman" in g.people_labels["wife"][0])
+# _spouse_dependents walks the husband's families to find his wives, and
+# _spouse_surnames_for then walks hers to find her husbands - the same
+# family both times, so the two share one memo
+fam_reads=[]
+_origf=db.get_family_from_handle
+db.get_family_from_handle=lambda h:(fam_reads.append(h), _origf(h))[1]
+per_reads=[]
+_origp=db.get_person_from_handle
+db.get_person_from_handle=lambda h:(per_reads.append(h), _origp(h))[1]
+g.on_people_changed(["hus"])
+check("the family was read once, not twice: %r" % fam_reads,
+      fam_reads==["f1"])
+check("and each person once: %r" % sorted(per_reads),
+      sorted(per_reads)==["hus","wife"])
+db.get_family_from_handle=_origf; db.get_person_from_handle=_origp
 db.people["hus"]=Person("x", names=[Name("Ernest","Newname")],
                          families=["f1"])
 g.on_people_changed(["hus"])

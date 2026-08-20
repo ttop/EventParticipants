@@ -33,6 +33,7 @@ from gi.repository import GLib, Gtk, Pango
 
 from gramps.gen.plug import Gramplet
 from gramps.gen.lib import Date, EventRef, EventRoleType, EventType
+from gramps.gen.lib.date import gregorian
 from gramps.gen.db import DbTxn
 from gramps.gen.display.name import displayer as name_displayer
 from gramps.gen.datehandler import get_date
@@ -63,6 +64,13 @@ COMP_SEARCH = 2    # folded text the matcher searches, never displayed
 # database reads per person for the birth and death years, so on a few
 # thousand people it must not run in one go on the main loop.
 INDEX_CHUNK = 250
+
+# Above this many people, a re-cache moves onto idle turns instead of running
+# inside the signal handler that asked for it. Correcting the date of a
+# shared event touches every participant, and a census can have hundreds:
+# each costs a person read plus their birth, death and family reads, which is
+# the query-per-person freeze the raw index was written to get away from.
+RECACHE_CHUNK = 50
 
 # Most rows the type-ahead will offer at once. GtkEntryCompletion shows model
 # rows in model order, so the model is rebuilt per keystroke, best first.
@@ -167,19 +175,17 @@ def _gregorian_year(date):
     Date.get_year() answers in the date's *own* calendar, so one event
     entered in the Hebrew calendar reads as year 5686: nonsense in a label,
     and on its own enough for _alive_at() to rule out everybody in the tree.
-    gen/lib/date.py:2133 converts the same way.
+    The conversion is Gramps' own gregorian() (gen/lib/date.py:2133), which
+    leaves the original object alone.
     """
     if date is None:
         return 0
     try:
-        if date.get_calendar() != Date.CAL_GREGORIAN:
-            converted = Date(date)
-            converted.convert_calendar(Date.CAL_GREGORIAN)
-            return converted.get_year() or 0
+        return gregorian(date).get_year() or 0
     except Exception:
         LOG.debug("could not convert a date to the Gregorian calendar",
                   exc_info=True)
-    return date.get_year() or 0
+        return date.get_year() or 0
 
 
 def _raw_year(date_data):
@@ -353,6 +359,8 @@ class AddParticipants(Gramplet):
         self._applying = False      # inside our own apply transaction
         self._notice = ""           # one-shot message for the status label
         self._family_spouses = {}   # listed family handle -> spouse handles
+        self._recache_pending = set()   # people waiting to be re-cached
+        self._recache_id = 0        # idle source draining that set
         self.gui.WIDGET = self.build_gui()
         container = self.gui.get_container_widget()
         if self.gui.textview in container.get_children():
@@ -532,6 +540,41 @@ class AddParticipants(Gramplet):
             GLib.source_remove(self._rebuild_id)
         self._rebuild_id = 0
 
+    def _queue_recache(self, handles):
+        """Re-cache a large batch of people a chunk at a time.
+
+        The signal handler that asked for it returns immediately: the work
+        costs a read per person plus their birth, death and family reads, and
+        a shared event whose date was corrected can name hundreds of them.
+        """
+        self._recache_pending.update(handles)
+        if not self._recache_id:
+            self._recache_id = GLib.idle_add(
+                self._recache_chunk, priority=GLib.PRIORITY_LOW
+            )
+
+    def _recache_chunk(self):
+        """Absorb one slice of the pending set, then yield to the main loop."""
+        batch = []
+        while self._recache_pending and len(batch) < RECACHE_CHUNK:
+            batch.append(self._recache_pending.pop())
+        try:
+            if batch:
+                self._recache_people(batch, removed=False)
+        except Exception:
+            LOG.exception("Add Participants: re-caching a batch failed")
+        if self._recache_pending:
+            return True
+        self._recache_id = 0
+        return False
+
+    def _cancel_recache(self):
+        """Drop any queued re-cache, e.g. when the whole index is rebuilt."""
+        if self._recache_id:
+            GLib.source_remove(self._recache_id)
+        self._recache_id = 0
+        self._recache_pending = set()
+
     def on_people_changed(self, handles=None):
         """Refresh only the people that actually changed.
 
@@ -560,9 +603,13 @@ class AddParticipants(Gramplet):
             self.build_people_cache()
             return
         for handle in handles:
-            event = self._get_event(handle)
-            year = 0 if event is None else _gregorian_year(
-                event.get_date_object())
+            try:
+                event = self._get_event(handle)
+                year = 0 if event is None else _gregorian_year(
+                    event.get_date_object())
+            except Exception:
+                LOG.debug("could not re-read event %s", handle, exc_info=True)
+                continue
             if year:
                 self._index_years[handle] = year
             else:
@@ -635,27 +682,32 @@ class AddParticipants(Gramplet):
             return
         wives = set()
         for handle in handles:
-            # The wife the family used to have, for the case where the
-            # family itself is gone and cannot be asked any more.
-            previous = self._index_mothers.pop(handle, None)
-            if previous:
-                wives.add(previous)
-            family = self._get_family(handle)
-            if family is None:
-                # A family that is listed but gone covers nobody any more.
-                self._family_spouses.pop(handle, None)
-                continue
-            mother = family.get_mother_handle()
-            if mother:
-                self._index_mothers[handle] = mother
-                wives.add(mother)
-            if handle in self._family_spouses:
-                # A spouse who has just been unlinked stops being covered by
-                # this row, and one who has just been linked starts.
-                self._family_spouses[handle] = tuple(
-                    spouse for spouse in (family.get_father_handle(), mother)
-                    if spouse
-                )
+            try:
+                # The wife the family used to have, for the case where the
+                # family itself is gone and cannot be asked any more.
+                previous = self._index_mothers.pop(handle, None)
+                if previous:
+                    wives.add(previous)
+                family = self._get_family(handle)
+                if family is None:
+                    # A family that is listed but gone covers nobody now.
+                    self._family_spouses.pop(handle, None)
+                    continue
+                mother = family.get_mother_handle()
+                if mother:
+                    self._index_mothers[handle] = mother
+                    wives.add(mother)
+                if handle in self._family_spouses:
+                    # A spouse just unlinked stops being covered by this
+                    # row, and one just linked starts.
+                    self._family_spouses[handle] = tuple(
+                        spouse
+                        for spouse in (family.get_father_handle(), mother)
+                        if spouse
+                    )
+            except Exception:
+                # One unreadable family must not abandon the rest.
+                LOG.debug("could not re-read family %s", handle, exc_info=True)
         if wives:
             self._recache_people(sorted(wives), removed=False)
         self.refresh_completion()
@@ -664,16 +716,30 @@ class AddParticipants(Gramplet):
         if handles is None:
             self.build_people_cache()
             return
+        if not removed and len(handles) > RECACHE_CHUNK:
+            # Too many to read inside a signal handler - see _queue_recache.
+            # A deletion is cheap (no reads at all) and has to take effect at
+            # once, so it never goes this way.
+            self._queue_recache(handles)
+            return
         removed_set = set(handles) if removed else set()
-        # Read each touched person once; the spouse lookups below reuse it, so
-        # a person with no families still costs a single read, as before.
+        # Read each touched person and family once; the spouse lookups below
+        # go through the same two memos, so a person with no families still
+        # costs a single read, as before.
         people = {}
+        families = {}
 
         def person_at(handle):
             """The person behind a handle, read at most once per call."""
             if handle not in people:
                 people[handle] = self._get_person(handle)
             return people[handle]
+
+        def family_at(handle):
+            """The family behind a handle, read at most once per call."""
+            if handle not in families:
+                families[handle] = self._get_family(handle)
+            return families[handle]
 
         for handle in handles:
             if handle not in removed_set:
@@ -684,28 +750,45 @@ class AddParticipants(Gramplet):
         # the surname she married into.
         to_cache = set(people)
         to_cache.update(removed_set)
-        for handle, person in people.items():
-            if person is not None:
-                to_cache.update(self._spouse_dependents(handle, person))
+        for handle, person in list(people.items()):
+            if person is None:
+                continue
+            # One corrupt record must not abandon the rest of the batch: an
+            # exception here is swallowed by Callback.emit with nothing but a
+            # log line (gen/utils/callback.py:427), which is the silent
+            # staleness the per-row index guards exist to prevent.
+            try:
+                to_cache.update(
+                    self._spouse_dependents(handle, person, family_at))
+            except Exception:
+                LOG.debug("could not read the families of %s", handle,
+                          exc_info=True)
         # Keep the married-surname map in step before the labels are rebuilt,
         # since both the label and the search text read from it.
         for handle in to_cache:
             if handle in removed_set:
                 self._index_spouses.pop(handle, None)
                 continue
-            person = person_at(handle)
-            if person is not None:
-                self._index_spouses[handle] = self._spouse_surnames_for(
-                    handle, person)
+            try:
+                person = person_at(handle)
+                if person is not None:
+                    self._index_spouses[handle] = self._spouse_surnames_for(
+                        handle, person, family_at, person_at)
+            except Exception:
+                LOG.debug("could not refresh the married surnames of %s",
+                          handle, exc_info=True)
         for handle in to_cache:
             self.people_labels.pop(handle, None)
             if handle in removed_set:
                 self._index_lifespan.pop(handle, None)
                 self._index_forms.pop(handle, None)
                 continue
-            person = person_at(handle)
-            if person is not None:
-                self.people_labels[handle] = self._person_entry(person)
+            try:
+                person = person_at(handle)
+                if person is not None:
+                    self.people_labels[handle] = self._person_entry(person)
+            except Exception:
+                LOG.debug("could not re-index %s", handle, exc_info=True)
         if self._index_id:
             # A build is in flight; it publishes the sorted list when it
             # finishes, so skip the expensive re-sort but keep the change -
@@ -725,33 +808,44 @@ class AddParticipants(Gramplet):
         primary = person.get_primary_name()
         return primary.get_surname() if primary else ""
 
-    def _spouse_surnames_for(self, handle, person):
+    def _spouse_surnames_for(self, handle, person, family_at=None,
+                             person_at=None):
         """Surnames `person` is known by through marriage, read live from her
         families: for each family where she is the wife, the husband's
         surname unless it is already her own. Mirrors _build_spouse_map for a
         single person, so someone added or renamed mid-session is searchable
-        by the name she married into without a full rebuild."""
+        by the name she married into without a full rebuild.
+
+        `family_at` and `person_at` are the caller's memos, so a batch that
+        touches a husband and his wives walks each family once between them
+        rather than once per helper."""
+        family_at = family_at or self._get_family
+        person_at = person_at or self._get_person
         own = self._primary_surname(person)
         result = set()
         for fam_handle in person.family_list:
-            family = self._get_family(fam_handle)
+            family = family_at(fam_handle)
             if family is None or family.get_mother_handle() != handle:
                 continue
             father = family.get_father_handle()
             if not father:
                 continue
-            surname = self._primary_surname(self._get_person(father))
+            surname = self._primary_surname(person_at(father))
             if surname and surname != own:
                 result.add(surname)
         return sorted(result)
 
-    def _spouse_dependents(self, handle, person):
+    def _spouse_dependents(self, handle, person, family_at=None):
         """Spouses whose surname set includes `person`'s - her husbands' wives
         take his surname, so they must be re-cached when a husband is added or
-        renamed; a wife's own set does not depend on anyone else's."""
+        renamed; a wife's own set does not depend on anyone else's.
+
+        `family_at` is the caller's memo, shared with _spouse_surnames_for so
+        the same families are not walked twice per batch."""
+        family_at = family_at or self._get_family
         wives = set()
         for fam_handle in person.family_list:
-            family = self._get_family(fam_handle)
+            family = family_at(fam_handle)
             if family is not None and family.get_father_handle() == handle:
                 mother = family.get_mother_handle()
                 if mother:
@@ -789,6 +883,8 @@ class AddParticipants(Gramplet):
         that anything is happening.
         """
         self._cancel_index()
+        # A full rebuild supersedes anything queued against the old index.
+        self._cancel_recache()
         db = self.dbstate.db
         self.people_labels = {}
         self._index_lifespan = {}

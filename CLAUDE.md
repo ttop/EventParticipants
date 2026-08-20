@@ -175,17 +175,34 @@ rather than calling the db directly.
   referenced by the Family object, so a person-only list would be misleading.
   Detaching a family drops both spouses at once; that's correct but blunt.
   **A listed family also covers both its spouses in the type-ahead**
-  (`_listed_person_handles()`): the Events view counts them through the family
+  (`_covered_by_family()`): the Events view counts them through the family
   reference, so offering one again wrote a second, personal reference at
   Primary and had the column count them twice. Giving a spouse a role of their
   own at a family event is still possible the stock way, which is the deal
   this gramplet always makes.
+  The coverage is bookkeeping in three places, and all three are needed:
+  the spouse handles are recorded **when the row loads** (`_family_spouses`),
+  because `refresh_completion` tests the excluded set *before* its own early
+  return and re-reading every listed family from the database there defeated
+  it; un-detaching a family drops any spouse staged while it was detached
+  (`_drop_covered_staged`), since Remove-then-Remove otherwise walked straight
+  back into the double count; and `on_apply` repeats the guard where the
+  writing happens rather than trusting the offer.
 - `main()` only rebuilds the list when the active event handle actually changes,
   so an incidental refresh doesn't discard pending edits. When the handle
   *does* change with edits staged, it says how many it discarded, in the
   status label and the main window's status bar. Deliberately not a dialog:
   this runs inside the history's `active-changed` handler, where re-entering
   the main loop is not something a headless test can vouch for.
+  **Count before clearing, on every path that discards.** Deleting the active
+  event and switching trees both empty the model themselves, so by the time
+  `main()` runs there is nothing left to count and the promise silently did
+  not hold.
+- **A status notice shows alongside the pending counts, not instead of them**
+  (`update_status`). A notice that only appeared when nothing was pending was
+  a notice nobody could ever see: the counts win almost every time, and the
+  interesting notices ("this event changed elsewhere") are exactly the ones
+  raised while edits are staged. Notices are still one-shot.
 - **The gramplet watches events, families and bulk rebuilds, not just
   people.** Three classes of change used to arrive as silence:
   `event-update`/`event-delete`, because `active-changed` only fires when the
@@ -201,8 +218,25 @@ rather than calling the db directly.
   with signals disabled and announce the result with `request_rebuild()`
   alone (`gen/db/generic.py:2646`), leaving every imported person unsearchable
   until the tree was reopened. The three rebuild signals are coalesced onto
-  one idle turn. `on_apply` sets `_applying` so its own transaction's signals
-  do not re-enter the event handlers and wipe the result message.
+  one idle turn, and a coalesced rebuild is cancelled when the tree changes
+  so an import's rebuild cannot fire against the tree that replaced it.
+  `on_apply` sets `_applying` so its own transaction's signals do not
+  re-enter the event handlers and wipe the result message.
+- **Signal handlers must survive one bad record, and must not read the tree
+  a person at a time.** `Callback.emit` swallows anything a handler raises
+  with nothing but a log line (`gen/utils/callback.py:427`), so a handler that
+  dies half way through a batch leaves stale labels and no sign at all — the
+  same silent staleness the per-row index guards were added for. Every
+  per-handle body in `_recache_people`, `on_events_changed` and
+  `on_families_changed` is guarded on its own.
+  And a re-cache of more than `RECACHE_CHUNK` people moves onto idle turns
+  (`_queue_recache`): correcting a shared event's date names every
+  participant, and a census with hundreds of them costs a read each plus
+  their birth, death and family reads. Deletions stay synchronous — they do
+  no reads and have to take effect at once. Within a batch, `_recache_people`
+  memoises both the people and the families it touches, and hands both memos
+  to `_spouse_dependents` and `_spouse_surnames_for` so the same family is
+  not walked twice.
 - Undated events (`get_sort_value()` of 0) are appended rather than sorted, so
   deliberate manual ordering isn't disturbed. Manual event ordering is a feature
   the user actively likes — do not add anything that bulk-reorders event lists.
@@ -219,8 +253,14 @@ rather than calling the db directly.
   "Soren" now finds "Søren" as the docstring always claimed — and indexes an
   apostrophe-elided variant of each word, because splitting turned O'Brien
   into "o brien" and a one-word "obrien" then matched nobody.
+  **The map is applied after NFKD, never before.** "ǿ" (U+01FF) decomposes to
+  "ø" plus a combining acute, so translating first left the stroke behind and
+  the name went into the index under a spelling nobody can type.
 - **Enter compares what was typed against the name forms, not the label.**
-  `_index_forms` holds each person's whole-name forms as word *sets*. The
+  `_index_forms` holds each person's whole-name forms as word *sets* — one
+  set per *spelling*, since `_fold` indexes an apostrophe word both split and
+  elided and a single combined set made every way of typing "O'Brien" a
+  strict subset of it and so never an exact match (`_fold_variants`). The
   disambiguator used to compare `_fold(label)`, which carries years and
   bracketed annotations, so anyone with a date could never be an exact match
   at all, and it demanded surname-first order. When Enter stages nobody it
@@ -238,7 +278,11 @@ rather than calling the db directly.
   add *only* a given name, so leaving those unlabelled hid the reason for
   most alias matches. Nick and call names have always been searchable and
   were invisible until they were added here. A call name is usually one of
-  the given names already shown, so it only earns a place when it is not.
+  the given names already shown, so it only earns a place when it is not —
+  tested **whole word and case-folded**, since the search index holds whole
+  words: a substring test hid call name "Ann" behind given name "Annette"
+  while "ann" stayed separately findable, which is the invisible match the
+  rule exists to stop.
   If a future change adds another searchable field, annotate it here too.
 - **Type-ahead results are ranked, so the model is rebuilt per keystroke.**
   `GtkEntryCompletion` filters but never reorders — it shows model rows in
