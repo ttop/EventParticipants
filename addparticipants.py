@@ -94,16 +94,30 @@ STATE_TEXT = {
 
 
 def _raw_surname(name_data):
-    """Approximate SurnameBase.get_surname() from raw data."""
-    parts = []
+    """SurnameBase.get_surname() from raw data.
+
+    A faithful mirror of gen/lib/surnamebase.py:180, joiner for joiner: the
+    raw and object index paths have to produce byte-identical names, and the
+    married-surname map compares a husband's surname read one way against a
+    wife's read the other. Dropping the connector, or skipping a surname part
+    that has only a prefix, made the two disagree about the same person.
+    """
+    totalsurn = ""
     for surname in name_data["surname_list"]:
-        value = surname["surname"]
+        fsurn = surname["surname"]
         prefix = surname["prefix"]
-        if prefix and value:
-            value = "%s %s" % (prefix, value)
-        if value:
-            parts.append(value)
-    return " ".join(parts)
+        if prefix:
+            fsurn = _("%(first)s %(second)s") % {"first": prefix,
+                                                 "second": fsurn}
+        fsurn = fsurn.strip()
+        connector = surname["connector"]
+        if connector:
+            fsurn = _("%(first)s %(second)s") % {"first": fsurn,
+                                                 "second": connector}
+        fsurn = fsurn.strip()
+        totalsurn = _("%(first)s %(second)s") % {"first": totalsurn,
+                                                 "second": fsurn}
+    return totalsurn.strip()
 
 
 def _fold(text):

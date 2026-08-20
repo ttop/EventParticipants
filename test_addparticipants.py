@@ -111,21 +111,40 @@ _mod("gramps"); _mod("gramps.gen")
 _mod("gramps.gen.plug", Gramplet=type("Gramplet",(),{}))
 _mod("gramps.gen.lib", EventRef=EventRef, EventRoleType=EventRoleType)
 _mod("gramps.gen.db", DbTxn=DbTxn)
+def _format_surnames(parts):
+    """SurnameBase.get_surname() over (surname, prefix, connector) triples.
+
+    Mirrors gramps/gen/lib/surnamebase.py:180. Both halves of the stub go
+    through this, so neither the object nor the raw side of the parity test
+    is allowed to define the answer by calling the gramplet's own reader.
+    """
+    totalsurn = ""
+    for surname, prefix, connector in parts:
+        fsurn = "%s %s" % (prefix, surname) if prefix else surname
+        fsurn = fsurn.strip()
+        if connector:
+            fsurn = "%s %s" % (fsurn, connector)
+        totalsurn = "%s %s" % (totalsurn, fsurn.strip())
+    return totalsurn.strip()
+
 class Name:
     """Stands in for gramps.gen.lib.Name."""
     def __init__(self, given="", surname="", ntype=None, call="", nick="",
-                 raw=None):
-        self.given=given; self.surname=surname; self.ntype=ntype
+                 raw=None, surnames=None):
+        self.given=given; self.ntype=ntype
         self.call=call; self.nick=nick; self.raw=raw
+        # (surname, prefix, connector) triples, as Gramps stores them
+        self.parts=list(surnames) if surnames is not None else [(surname,"","")]
     def get_first_name(self): return self.given
-    def get_surname(self): return self.surname
+    def get_surname(self): return _format_surnames(self.parts)
     def get_call_name(self): return self.call
     def get_nick_name(self): return self.nick
     def get_type(self): return self.ntype
     def display(self):
         if self.raw is not None: return self.raw
         # LNFN, the Gramps default: "Surname, Given"
-        return ("%s, %s" % (self.surname, self.given)).strip().strip(",").strip()
+        return ("%s, %s" % (self.get_surname(), self.given)
+                ).strip().strip(",").strip()
 
 class _Displayer:
     @staticmethod
@@ -135,7 +154,8 @@ class _Displayer:
     @staticmethod
     def raw_display_name(raw):
         """Same LNFN formatting, but from stored data instead of a Name."""
-        surname=" ".join(x["surname"] for x in raw["surname_list"] if x["surname"])
+        surname=_format_surnames([(x["surname"],x["prefix"],x["connector"])
+                                  for x in raw["surname_list"]])
         return ("%s, %s" % (surname, raw["first_name"])).strip().strip(",").strip()
 
 _mod("gramps.gen.display")
@@ -159,8 +179,9 @@ class Ev:
     def __init__(self,s,year=0): self._s=s; self._y=year
     def get_date_object(self): return _Date(self._s,self._y)
 class Family:
-    def __init__(self,father=None,mother=None):
-        self._father=father; self._mother=mother
+    def __init__(self,father=None,mother=None,handle=None):
+        self._father=father; self._mother=mother; self.handle=handle
+    def get_handle(self): return self.handle
     def get_father_handle(self): return self._father
     def get_mother_handle(self): return self._mother
 class Person:
@@ -181,9 +202,10 @@ def _raw_name(n):
     """A Name stub rendered as the dict the database actually stores."""
     if n.raw is not None:
         return {"display_as":0,"first_name":"","call":"","nick":"",
-                "surname_list":[{"surname":n.raw,"prefix":""}]}
+                "surname_list":[{"surname":n.raw,"prefix":"","connector":""}]}
     return {"display_as":0,"first_name":n.given,"call":n.call,"nick":n.nick,
-            "surname_list":[{"surname":n.surname,"prefix":""}]}
+            "surname_list":[{"surname":s,"prefix":p,"connector":c}
+                            for s,p,c in n.parts]}
 
 class _Cursor:
     """Mimics gen.db.generic.Cursor: yields (handle, raw data)."""
@@ -194,9 +216,16 @@ class _Cursor:
         for d in self.rows: yield (d["handle"], d)
 
 class FakeDb:
+    """One store per object type.
+
+    Families used to live in two: a list of raw dicts for the cursor and a
+    dict of objects for get_family_from_handle(). A test that filled only one
+    of them silently asserted nothing, because the build-time entry it meant
+    to overwrite had never existed. Both views are derived from `families`
+    here so that cannot happen again.
+    """
     def __init__(self):
         self.people={}; self.events={}; self.families={}; self.emitted=[]
-        self.raw_families=[]
     def _ref_index(self, person, handle):
         for i,r in enumerate(person.refs):
             if r.ref==handle: return i
@@ -212,7 +241,10 @@ class FakeDb:
     def get_person_cursor(self):
         return _Cursor([self._raw_person(h,p) for h,p in self.people.items()])
     def get_family_cursor(self):
-        return _Cursor(getattr(self, "raw_families", []))
+        return _Cursor([{"handle":h,
+                         "father_handle":f.get_father_handle(),
+                         "mother_handle":f.get_mother_handle()}
+                        for h,f in self.families.items()])
     def get_event_cursor(self):
         return _Cursor([{"handle":h,
                          "date":{"dateval":[0,0,
@@ -231,7 +263,7 @@ class FakeDb:
         return self.events[h]
     def get_family_from_handle(self,h):
         if h not in self.families: raise HandleError(h)
-        return self.families[h]
+        f=self.families[h]; f.handle=h; return f
 
 def make():
     g=ap.AddParticipants.__new__(ap.AddParticipants)
@@ -548,29 +580,59 @@ check("and reachable in the sorted index",
       any(h=="late" for _l,h,_s in g.people_cache))
 
 print("\n[S] raw indexing and the object path agree exactly")
-names=[Name("Jane","Doe"), Name("Jane","Smith",ntype=3)]
+# Every kind of name that can make someone match has to read the same from
+# the stored dicts and from a built Person, or the search box behaves
+# differently depending on which path the index happened to take.
 
-def indexed(force_object):
-    g,db=make()
-    db.events["E1"]=Ev(0,1901); db.events["E2"]=Ev(0,1980)
-    db.people["p1"]=Person("x", names=names, b="E1", d="E2",
-                           refs=[Ref("E1"),Ref("E2")])
-    if force_object:
-        def boom(): raise RuntimeError("no cursor here")
-        db.get_person_cursor=boom
-    g.build_people_cache(); drain(g)
-    return g, g.people_labels.get("p1")
+def parity(title, names, spouse=None):
+    """Index one person both ways; insist the two agree byte for byte."""
+    entries=[]
+    for force_object in (False, True):
+        g,db=make()
+        db.events["E1"]=Ev(0,1901); db.events["E2"]=Ev(0,1980)
+        db.people["p1"]=Person("x", names=names, b="E1", d="E2",
+                               refs=[Ref("E1"),Ref("E2")])
+        if spouse is not None:
+            db.people["sp"]=Person("x", names=[spouse])
+            db.families["f1"]=Family(father="sp", mother="p1")
+        if force_object:
+            def boom(): raise RuntimeError("no cursor here")
+            db.get_person_cursor=boom
+        g.build_people_cache(); drain(g)
+        check("%s: the %s path indexed the person"
+              % (title, "object" if force_object else "raw"),
+              g._index_raw is not force_object and "p1" in g.people_labels)
+        entries.append(g.people_labels.get("p1"))
+    raw, obj = entries
+    ok = raw is not None and obj is not None
+    check("%s: labels identical: %r" % (title, ok and raw[0]),
+          ok and raw[0]==obj[0])
+    check("%s: search text identical" % title, ok and raw[1]==obj[1])
+    return raw[0] if ok else ""
 
-g_raw, raw_entry = indexed(force_object=False)
-g_obj, obj_entry = indexed(force_object=True)
-check("raw path used a cursor", g_raw._index_raw is True)
-check("object path fell back", g_obj._index_raw is False)
-check("both produced an entry", raw_entry is not None and obj_entry is not None)
-check("labels identical: %r" % (raw_entry[0],), raw_entry[0]==obj_entry[0])
-check("search text identical", raw_entry[1]==obj_entry[1])
-check("years came through the year map", 
-      "1901" in raw_entry[0] and "1980" in raw_entry[0])
-check("married surname still annotated", "[Smith]" in raw_entry[0])
+lab = parity("plain", [Name("Jane","Doe"), Name("Jane","Smith",ntype=3)])
+check("years came through the year map: %r" % lab,
+      "1901" in lab and "1980" in lab)
+check("married surname still annotated", "[Smith]" in lab)
+
+lab = parity("connector", [Name("Jean", surnames=[("Rossi","de","y"),
+                                                  ("Pardo","","")])])
+check("the connector survives both readers: %r" % lab, "y" in lab.split())
+check("...and so do both surname parts",
+      "Rossi" in lab and "Pardo" in lab and "de" in lab.split())
+
+lab = parity("prefix only", [Name("Willem", surnames=[("","van der","")])])
+check("a surname that is only a prefix is not dropped: %r" % lab,
+      "van der" in lab)
+
+lab = parity("aka", [Name("Lura Ruth","Casey"), Name("Loretta","")])
+check("an alternate given name is annotated the same way: %r" % lab,
+      "aka Loretta" in lab)
+
+lab = parity("married", [Name("Louisa","Heitt")],
+             spouse=Name("Ernest","Reyman"))
+check("a surname reached by marriage is annotated the same way: %r" % lab,
+      "m. Reyman" in lab)
 
 print("\n[T] a broken raw layout degrades instead of emptying the index")
 g,db=make()
@@ -588,7 +650,7 @@ print("\n[U] a surname reached by marriage is searchable")
 g,db=make()
 db.people["lou"]=Person("x", names=[Name("Louisa","Heitt")])
 db.people["ern"]=Person("x", names=[Name("Ernest August","Reyman")])
-db.raw_families=[{"handle":"f1","father_handle":"ern","mother_handle":"lou"}]
+db.families["f1"]=Family(father="ern", mother="lou")
 g.build_people_cache(); drain(g)
 
 def hits(typed):
@@ -616,7 +678,7 @@ print("\n[V] spouse surnames survive the object fallback")
 g,db=make()
 db.people["lou"]=Person("x", names=[Name("Louisa","Heitt")])
 db.people["ern"]=Person("x", names=[Name("Ernest","Reyman")])
-db.raw_families=[{"handle":"f1","father_handle":"ern","mother_handle":"lou"}]
+db.families["f1"]=Family(father="ern", mother="lou")
 db.get_person_cursor=lambda: (_ for _ in ()).throw(RuntimeError("no cursor"))
 db.get_person_handles=lambda sort_handles=False: list(db.people)
 g.build_people_cache(); drain(g)
@@ -630,7 +692,7 @@ db.people["a"]=Person("x", names=[Name("John Mervyn","Joy")])
 db.people["b"]=Person("x", names=[Name("Bonnie E.","Johnson")])
 db.people["c"]=Person("x", names=[Name("Daniel John","Joy")])
 # Bonnie married a Joy, so she matches "Joy" through her married surname
-db.raw_families=[{"handle":"f1","father_handle":"a","mother_handle":"b"}]
+db.families["f1"]=Family(father="a", mother="b")
 g.build_people_cache(); drain(g)
 
 order=[l for l,_h,_s in g._ranked_matches("John Joy")]
@@ -767,7 +829,7 @@ check("a duplicate alternate adds no clutter: %r" % g.people_labels["p1"][0],
 g,db=make()
 db.people["w"]=Person("x", names=[Name("Jane","Doe"), Name("Janie","Smith")])
 db.people["h"]=Person("x", names=[Name("Bob","Brown")])
-db.raw_families=[{"handle":"f1","father_handle":"h","mother_handle":"w"}]
+db.families["f1"]=Family(father="h", mother="w")
 g.build_people_cache(); drain(g)
 lab=g.people_labels["w"][0]
 check("surname, alias and marriage all shown: %r" % lab,
@@ -852,7 +914,7 @@ check("'Louisa Reyman' finds her: %r" % hits(g, "Louisa Reyman"),
 check("he himself is NOT findable by her maiden name",
       not any("Heitt" in m for m in hits(g, "Ernest Heitt")))
 
-# (c) a rename of an existing wife's surname still stays one-directional
+# (c) renaming an existing husband replaces the entry the build already made
 g,db=make()
 db.people["hus"]=Person("x", names=[Name("Ernest","Reyman")],
                          families=["f1"])
@@ -860,6 +922,8 @@ db.people["wife"]=Person("x", names=[Name("Louisa","Heitt")],
                           families=["f1"])
 db.families["f1"]=Family(father="hus", mother="wife")
 g.build_people_cache(); drain(g)
+check("the build itself gave her his surname: %r" % g.people_labels["wife"][0],
+      "m. Reyman" in g.people_labels["wife"][0])
 db.people["hus"]=Person("x", names=[Name("Ernest","Newname")],
                          families=["f1"])
 g.on_people_changed(["hus"])
