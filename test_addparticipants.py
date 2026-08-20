@@ -32,6 +32,9 @@ class _ListStore:
     def append(self, row): self.rows.append(list(row))
     def clear(self): self.rows = []
     def remove(self, i): self.rows.pop(i)
+    # Gtk.TreeModel.__delitem__ turns an int into an iter and removes it
+    # (gi/overrides/Gtk.py:932), which is how _drop_covered_staged deletes.
+    def __delitem__(self, i): self.rows.pop(int(i))
     def __iter__(self): return iter(self.rows)
     def __getitem__(self, i): return self.rows[int(i)]
     def __len__(self): return len(self.rows)
@@ -252,12 +255,21 @@ class Ev:
         date.set(calendar=self._c, value=(0,0,self._y,False))
         date.sortval=self._s
         return date
+class _Iter(int):
+    """Stands in for a Gtk.TreeIter: indexes a row like a number but, like a
+    real iter, is never falsy - row 0 is a real row."""
+    def __bool__(self): return True
+
 class Family:
-    def __init__(self,father=None,mother=None,handle=None):
+    def __init__(self,father=None,mother=None,handle=None,refs=None):
         self._father=father; self._mother=mother; self.handle=handle
+        self.refs=refs or []
     def get_handle(self): return self.handle
     def get_father_handle(self): return self._father
     def get_mother_handle(self): return self._mother
+    def get_gramps_id(self): return self.handle or "F?"
+    def get_event_ref_list(self): return self.refs
+    def set_event_ref_list(self,r): self.refs=r
 class Person:
     def __init__(self,name,b=None,d=None,refs=None,names=None,families=None):
         self.name=name; self._b=b; self._d=d; self.refs=refs or []
@@ -336,12 +348,16 @@ class FakeDb:
                                  "newyear":d.newyear,"sortval":d.sortval}})
         return _Cursor(rows)
     def find_backlink_handles(self, handle, include_classes=None):
-        """(class, handle) for everything referencing an event. Only people
-        carry event references in these stubs."""
+        """(class, handle) for everything referencing an event."""
         if include_classes is None or "Person" in include_classes:
             for h,p in self.people.items():
                 if any(r.ref==handle for r in p.refs):
                     yield ("Person", h)
+        if include_classes is None or "Family" in include_classes:
+            for h,f in self.families.items():
+                if any(r.ref==handle for r in f.refs):
+                    f.handle=h
+                    yield ("Family", h)
     def commit_event(self, event, trans, change_time=None):
         self.committed_events.append(event)
     def emit(self, signal, args): self.emitted.append((signal, args))
@@ -379,7 +395,7 @@ def make():
     g._index_lifespan={}; g._index_forms={}
     g._not_living=0; g._already_listed=0
     g._index_years={}; g._index_fallbacks={}; g._index_mothers={}
-    g._rebuild_id=0; g._applying=False; g._notice=""
+    g._rebuild_id=0; g._applying=False; g._notice=""; g._family_spouses={}
     g.event=None; g.event_handle=None
     g.last_status=None; g.placeholder=None
     g.updates=0
@@ -679,6 +695,21 @@ check("the edit landed on the right reference: %r"
 check("and it was counted as applied: %r" % g.last_status,
       "1 role change" in str(g.last_status)
       and "no longer matched" not in str(g.last_status))
+
+print("\n[O2b] a vanished object only counts its actual changes as skipped")
+g,db=make()
+db.events["E1"]=Ev(500)
+g.event=Ev(500); g.event.get_handle=lambda:"E1"
+# Two untouched rows and one real detachment, on a person deleted since the
+# list was loaded. Only the detachment was ever a pending change.
+g.model.append(row("Gone","Primary",ap.STATE_EXISTING,"p9","Person","Primary",0))
+g.model.append(row("Gone","Witness",ap.STATE_EXISTING,"p9","Person","Witness",1))
+g.model.append(row("Gone","Primary",ap.STATE_DETACH,"p9","Person","Primary",2))
+g.load_participants=lambda:None; g.refresh_completion=lambda force=False:None
+g.update_status=lambda:None
+g.on_apply(None)
+check("only the one real change is reported skipped: %r" % g.last_status,
+      "1 change(s) no longer matched" in str(g.last_status))
 
 print("\n[O3] Apply refuses to write to an event that has gone")
 g,db=make()
@@ -1320,13 +1351,30 @@ print("\n[AJ] a family participant covers both its spouses")
 # A marriage is referenced by the Family, and the Events view counts both
 # spouses through it. Offering one of them again wrote a second, personal
 # reference at Primary and had the Main Participants column count them twice.
-g,db=make()
-db.people["h"]=Person("x", names=[Name("Bob","Brown")])
-db.people["w"]=Person("x", names=[Name("Jane","Brown")])
-db.families["f1"]=Family(father="h", mother="w")
-g.build_people_cache(); drain(g)
-g.model.append(row("Family: Bob & Jane","Family",ap.STATE_EXISTING,
-                   "f1","Family","Family",0))
+
+def married_tree():
+    g,db=make()
+    db.events["E1"]=Ev(500,1900,etype=EventType.MARRIAGE)
+    db.people["h"]=Person("x", names=[Name("Bob","Brown")])
+    db.people["w"]=Person("x", names=[Name("Jane","Brown")])
+    db.families["f1"]=Family(father="h", mother="w",
+                             refs=[Ref("E1","Family")])
+    g.build_people_cache(); drain(g)
+    g.event=db.events["E1"]; g.event.get_handle=lambda:"E1"
+    g.event_handle="E1"
+    g.load_participants()
+    return g,db
+
+def select(g, index):
+    """Point the tree's selection at one row, the way a click would."""
+    sel=type("S",(),{"get_selected":lambda s:(g.model,_Iter(index))})()
+    g.tree=type("T",(),{"get_selection":lambda s:sel})()
+
+g,db=married_tree()
+check("the family is the participant (%d rows)" % len(g.model),
+      len(g.model)==1 and g.model[0][ap.COL_KIND]=="Family")
+check("its spouses were noted as the row loaded: %r" % (g._family_spouses,),
+      g._family_spouses.get("f1")==("h","w"))
 g.refresh_completion()
 check("both spouses are held to be listed already",
       g._completion_excluded=={"h","w"})
@@ -1342,6 +1390,39 @@ g._set_state(g.model[0], ap.STATE_DETACH)
 g.refresh_completion()
 check("detaching the family offers the spouses back",
       g._completion_excluded==frozenset())
+
+print("\n[AJ2] putting a detached family back unstages the spouse again")
+# Detach F, stage a spouse personally (allowed, F released them), then hit
+# Remove on F again to un-detach it. Applying both would write exactly the
+# duplicate reference the exclusion exists to prevent.
+g,db=married_tree()
+select(g, 0)
+g.on_remove(None)                       # detach the family
+check("the family is staged for detachment",
+      g.model[0][ap.COL_STATE]==ap.STATE_DETACH)
+g.stage_person("Brown, Bob","h")
+check("its husband can now be staged personally (%d rows)" % len(g.model),
+      len(g.model)==2)
+g.on_remove(None)                       # un-detach the family
+check("the family is attached again",
+      g.model[0][ap.COL_STATE]==ap.STATE_EXISTING)
+check("and the staged spouse is gone (%d rows)" % len(g.model),
+      len(g.model)==1)
+check("...with a word about why: %r" % g.last_status,
+      "covered by a family" in str(g.last_status))
+
+# and the transaction refuses it even if a row gets there some other way
+g,db=married_tree()
+g.model.append(row("Brown, Bob","Primary",ap.STATE_NEW,"h","Person","",-1))
+g.load_participants=lambda:None; g.refresh_completion=lambda force=False:None
+g.update_status=lambda:None
+g.on_apply(None)
+check("no personal reference was written: %r" % db.people["h"].refs,
+      db.people["h"].refs==[])
+check("the family reference is untouched (%d)" % len(db.families["f1"].refs),
+      len(db.families["f1"].refs)==1)
+check("and the apply says it skipped it: %r" % g.last_status,
+      "+0" in str(g.last_status) and "no longer matched" in str(g.last_status))
 
 print("\n[AK] a role typed in the wrong case is snapped to the real one")
 g,db=make()
@@ -1466,6 +1547,52 @@ g.event_handle="E1"
 g.main()
 check("nothing staged, nothing said: %r" % g.last_status,
       not str(g.last_status or ""))
+
+# the active event being deleted counts the edits before the model is cleared
+g,db=make()
+db.events["E1"]=Ev(500,1900)
+g.event=db.events["E1"]; g.event_handle="E1"
+g.model.append(row("Ann","Primary",ap.STATE_NEW,"p1","Person","",-1))
+g.model.append(row("Bea","Primary",ap.STATE_NEW,"p2","Person","",-1))
+del db.events["E1"]
+g.on_events_deleted(["E1"])
+check("a deleted active event owns up to what went with it: %r" % g.last_status,
+      "Discarded 2" in str(g.last_status))
+
+# a notice is shown next to the counts, not instead of them
+g,db=make()
+g.model.append(row("Ann","Primary",ap.STATE_NEW,"p1","Person","",-1))
+g._notice="Something happened"
+g.update_status()
+check("both the notice and the counts reach the label: %r" % g.last_status,
+      "Something happened" in str(g.last_status)
+      and "1 to add" in str(g.last_status))
+g.update_status()
+check("but the notice is one-shot: %r" % g.last_status,
+      "Something happened" not in str(g.last_status)
+      and "1 to add" in str(g.last_status))
+
+# an event edited elsewhere with edits staged says so, and is not swallowed
+g,db=make()
+db.events["E1"]=Ev(500,1900)
+g.event=db.events["E1"]; g.event_handle="E1"
+g.model.append(row("Ann","Primary",ap.STATE_NEW,"p1","Person","",-1))
+g.on_events_changed(["E1"])
+g.update_status()
+check("the 'changed elsewhere' notice survives to the label: %r" % g.last_status,
+      "changed elsewhere" in str(g.last_status)
+      and "1 to add" in str(g.last_status))
+
+print("\n[AN2] a queued bulk rebuild does not outlive its tree")
+g,db=make()
+db.people["p1"]=Person("x", names=[Name("Ann","Lee")])
+g.build_people_cache(); drain(g)
+g.on_tree_rebuilt()
+sid=g._rebuild_id
+check("a rebuild is queued", sid != 0)
+g._cancel_rebuild()
+check("cancelling clears the handle", g._rebuild_id==0)
+check("...and drops the idle source", GLib._sources.get(sid) is None)
 
 print("\n[AO] a nickname that finds someone is visible on their row")
 g,db=make()

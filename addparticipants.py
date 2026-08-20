@@ -126,6 +126,17 @@ def _raw_surname(name_data):
     return totalsurn.strip()
 
 
+def _is_staged(entry):
+    """Does this snapshotted model row actually ask for a change?
+
+    An existing participant whose role was never touched is not a pending
+    change, and counting one as skipped overstated how much of an apply had
+    failed to land.
+    """
+    role, orig_role, state, _nth = entry
+    return state != STATE_EXISTING or role != orig_role
+
+
 def _fallback_type_values():
     """Event type codes that stand in for a missing birth or death.
 
@@ -341,6 +352,7 @@ class AddParticipants(Gramplet):
         self._rebuild_id = 0        # idle source coalescing bulk rebuilds
         self._applying = False      # inside our own apply transaction
         self._notice = ""           # one-shot message for the status label
+        self._family_spouses = {}   # listed family handle -> spouse handles
         self.gui.WIDGET = self.build_gui()
         container = self.gui.get_container_widget()
         if self.gui.textview in container.get_children():
@@ -459,9 +471,16 @@ class AddParticipants(Gramplet):
         # A new tree invalidates the cached selection. Without this the
         # "did the handle change?" test in main() can leave the previous
         # tree's participants on screen.
+        # Count what is being thrown away first: once the model is empty
+        # main() has nothing left to count.
+        self._warn_discarded()
         self.event = None
         self.event_handle = None
         self.model.clear()
+        self._family_spouses = {}
+        # An import queued a rebuild against the tree that is going away;
+        # letting it fire would rebuild the new tree's index a second time.
+        self._cancel_rebuild()
         self.connect(self.dbstate.db, "person-add", self.on_people_changed)
         self.connect(self.dbstate.db, "person-update", self.on_people_changed)
         self.connect(self.dbstate.db, "person-delete", self.on_people_deleted)
@@ -506,6 +525,12 @@ class AddParticipants(Gramplet):
         self._rebuild_id = 0
         self.build_people_cache()
         return False
+
+    def _cancel_rebuild(self):
+        """Drop a queued bulk rebuild, e.g. when the tree changes."""
+        if self._rebuild_id:
+            GLib.source_remove(self._rebuild_id)
+        self._rebuild_id = 0
 
     def on_people_changed(self, handles=None):
         """Refresh only the people that actually changed.
@@ -563,6 +588,9 @@ class AddParticipants(Gramplet):
         if people:
             self._recache_people(sorted(people), removed=False)
         if self.event_handle in handles:
+            # Count before clearing: main() cannot say what was discarded
+            # once the model it would count is empty.
+            self._warn_discarded()
             self.event = None
             self.event_handle = None
             self.model.clear()
@@ -588,8 +616,8 @@ class AddParticipants(Gramplet):
         if self.event_handle not in handles:
             return
         if any(self.pending_counts()):
-            self._notice = _("This event changed elsewhere; "
-                             "Revert reloads the list")
+            self._report(_("This event changed elsewhere; "
+                           "Revert reloads the list"))
         else:
             # Forces load_participants() on the way through main().
             self.event_handle = None
@@ -614,13 +642,23 @@ class AddParticipants(Gramplet):
                 wives.add(previous)
             family = self._get_family(handle)
             if family is None:
+                # A family that is listed but gone covers nobody any more.
+                self._family_spouses.pop(handle, None)
                 continue
             mother = family.get_mother_handle()
             if mother:
                 self._index_mothers[handle] = mother
                 wives.add(mother)
+            if handle in self._family_spouses:
+                # A spouse who has just been unlinked stops being covered by
+                # this row, and one who has just been linked starts.
+                self._family_spouses[handle] = tuple(
+                    spouse for spouse in (family.get_father_handle(), mother)
+                    if spouse
+                )
         if wives:
             self._recache_people(sorted(wives), removed=False)
+        self.refresh_completion()
 
     def _recache_people(self, handles, removed):
         if handles is None:
@@ -1324,6 +1362,7 @@ class AddParticipants(Gramplet):
     def load_participants(self):
         """Populate the list from everything referencing this event."""
         self.model.clear()
+        self._family_spouses = {}
         db = self.dbstate.db
         ev_handle = self.event.get_handle()
 
@@ -1345,6 +1384,14 @@ class AddParticipants(Gramplet):
             elif class_name == "Family":
                 obj = self._get_family(handle)
                 label = self._family_label(obj) if obj else None
+                if obj is not None:
+                    # Noted here, once, so the offer's bookkeeping never has
+                    # to read the family back out of the database.
+                    self._family_spouses[handle] = tuple(
+                        spouse for spouse in (obj.get_father_handle(),
+                                              obj.get_mother_handle())
+                        if spouse
+                    )
             else:
                 continue
             if obj is None:
@@ -1365,8 +1412,8 @@ class AddParticipants(Gramplet):
                 )
                 nth += 1
 
-    def _listed_person_handles(self):
-        """Everyone the participant list already covers.
+    def _covered_by_family(self):
+        """Spouses a family row that is staying attached already covers.
 
         A participating family's reference stands for both its spouses, and
         that is how the Events view counts them, so offering one of them
@@ -1374,22 +1421,49 @@ class AddParticipants(Gramplet):
         personal reference at Primary and the Main Participants column
         counts them twice. Attaching a spouse in their own right, with a
         role of their own, is still possible the stock way.
+
+        The spouse handles were read when the row was loaded
+        (_family_spouses), so this stays a walk over the model: it runs
+        ahead of refresh_completion's early return, and re-reading every
+        listed family from the database on each keystroke's worth of
+        bookkeeping defeated the point of that early return.
         """
-        listed = set()
+        covered = set()
         for row in self.model:
-            if row[COL_STATE] == STATE_DETACH:
-                continue
-            if row[COL_KIND] == "Person":
+            if row[COL_KIND] == "Family" and row[COL_STATE] != STATE_DETACH:
+                covered.update(self._family_spouses.get(row[COL_HANDLE], ()))
+        return covered
+
+    def _listed_person_handles(self):
+        """Everyone the participant list already covers."""
+        listed = self._covered_by_family()
+        for row in self.model:
+            if row[COL_KIND] == "Person" and row[COL_STATE] != STATE_DETACH:
                 listed.add(row[COL_HANDLE])
-            elif row[COL_KIND] == "Family":
-                family = self._get_family(row[COL_HANDLE])
-                if family is None:
-                    continue
-                for handle in (family.get_father_handle(),
-                               family.get_mother_handle()):
-                    if handle:
-                        listed.add(handle)
         return frozenset(listed)
+
+    def _drop_covered_staged(self):
+        """Unstage anyone a family row has just taken back over.
+
+        Detaching a family releases its spouses into the offer, so one can
+        be staged personally; putting the family back covers them again, and
+        applying both would write the very duplicate reference
+        _covered_by_family exists to prevent.
+        """
+        covered = self._covered_by_family()
+        if not covered:
+            return
+        dropped = []
+        for index in reversed(range(len(self.model))):
+            row = self.model[index]
+            if (row[COL_STATE] == STATE_NEW and row[COL_KIND] == "Person"
+                    and row[COL_HANDLE] in covered):
+                dropped.append(row[COL_NAME])
+                del self.model[index]
+        if dropped:
+            self._notice = _("Unstaged %s: covered by a family again") % (
+                ", ".join(reversed(dropped))
+            )
 
     def refresh_completion(self, force=False):
         """Note who is already listed and refresh what the type-ahead offers.
@@ -1678,6 +1752,9 @@ class AddParticipants(Gramplet):
             model.remove(treeiter)
         elif state == STATE_DETACH:
             self._set_state(model[treeiter], STATE_EXISTING)
+            # Putting a family back covers its spouses again, so anyone
+            # staged personally while it was detached has to go.
+            self._drop_covered_staged()
         else:
             self._set_state(model[treeiter], STATE_DETACH)
         self.refresh_completion()
@@ -1709,10 +1786,16 @@ class AddParticipants(Gramplet):
             parts.append(_("%d role change(s)") % role_changes)
         if detachments:
             parts.append(_("%d to detach") % detachments)
-        # A notice is one-shot: it fills the label only while there is
-        # nothing pending to report, and never survives a second refresh.
+        # A notice is one-shot, and it is shown *alongside* the counts
+        # rather than instead of them: the counts almost always win, and a
+        # notice that only appears when there is nothing pending is a notice
+        # nobody ever reads.
         notice, self._notice = self._notice, ""
-        self.status.set_text(", ".join(parts) if parts else notice)
+        summary = ", ".join(parts)
+        if notice and summary:
+            self.status.set_text("%s (%s)" % (notice, summary))
+        else:
+            self.status.set_text(notice or summary)
         self.apply_btn.set_sensitive(bool(parts) and self.event is not None)
 
     # ------------------------------------------------------------------
@@ -1764,6 +1847,12 @@ class AddParticipants(Gramplet):
                  row[COL_REFNTH])
             )
 
+        # A family that is staying attached already covers its spouses. The
+        # offer knows that, but a person can still be staged while the family
+        # is detached and then have it put back, so the guard is repeated
+        # here where the writing happens.
+        covered = self._covered_by_family()
+
         # Counted as they happen rather than read off the model beforehand:
         # a row whose reference has moved under us is skipped, and saying
         # "applied" for it would be a lie.
@@ -1775,7 +1864,10 @@ class AddParticipants(Gramplet):
                 for (kind, handle), entries in by_object.items():
                     obj = self._get_object(kind, handle)
                     if obj is None:
-                        skipped += len(entries)
+                        # Only rows that actually asked for something count
+                        # as skipped; an untouched row was never a change.
+                        skipped += sum(1 for entry in entries
+                                       if _is_staged(entry))
                         continue
 
                     refs = list(obj.get_event_ref_list())
@@ -1817,6 +1909,11 @@ class AddParticipants(Gramplet):
                     # Additions last, so _insert_index sees the final list.
                     for role, _orig, state, _nth in entries:
                         if state != STATE_NEW:
+                            continue
+                        if kind == "Person" and handle in covered:
+                            # A family reference already stands for them;
+                            # a personal one on top is the double count.
+                            skipped += 1
                             continue
                         if any(ref.ref == ev_handle for ref in refs):
                             # Attached from somewhere else in the meantime.
