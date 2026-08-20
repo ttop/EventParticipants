@@ -201,18 +201,25 @@ def _form_keys(forms):
 
     A set of words rather than a string: the display format is "Surname,
     Given" and nobody types a name that way round.
+
+    Every spelling of a form gets a set of its own. _fold indexes an
+    apostrophe word both split and elided, so a single set for "O'Brien,
+    Sean" holds "o", "brien" *and* "obrien" - and every way of typing that
+    name is then a strict subset of it and never an exact match.
     """
     keys = set()
     for form in forms:
-        words = frozenset(_fold(form).split())
-        if words:
-            keys.add(words)
+        keys.update(_fold_variants(form))
     return frozenset(keys)
 
 
 # Letters whose difference lives in the letter itself rather than in a
 # combining accent, so NFKD leaves them exactly as they are. Without these
 # "Soren" never found "Søren", whatever the docstring promised.
+#
+# Applied *after* NFKD, never before: "ǿ" (U+01FF) decomposes to "ø" plus a
+# combining acute, so translating first left the stroked letter behind in the
+# index and "Sǿren" folded to "søren" - findable by no plain spelling at all.
 _FOLD_MAP = str.maketrans({
     "ø": "o", "Ø": "O",
     "æ": "ae", "Æ": "AE",
@@ -229,6 +236,31 @@ _WORD_SPLIT = re.compile(r"[^\w%s]+" % re.escape(_APOSTROPHES))
 _APOSTROPHE_SPLIT = re.compile(r"[%s]+" % re.escape(_APOSTROPHES))
 
 
+# A name with this many apostrophe words has more spellings than anyone will
+# type; past it _fold_variants stops enumerating and leans on the full set.
+MAX_FORM_VARIANTS = 16
+
+
+def _fold_words(text):
+    """The folded words of `text`, grouped one list per source word.
+
+    A plain word contributes one spelling; a word carrying an apostrophe
+    contributes its parts, which _fold and _fold_variants then recombine in
+    their own ways.
+    """
+    decomposed = unicodedata.normalize("NFKD", text or "")
+    bare = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+    bare = bare.translate(_FOLD_MAP)
+    groups = []
+    for chunk in _WORD_SPLIT.split(bare.casefold()):
+        if not chunk:
+            continue
+        parts = [part for part in _APOSTROPHE_SPLIT.split(chunk) if part]
+        if parts:
+            groups.append(parts)
+    return groups
+
+
 def _fold(text):
     """Reduce text to lowercase, unaccented, space-separated words.
 
@@ -240,18 +272,38 @@ def _fold(text):
     to "o brien" and to "obrien" alike - splitting alone left the one-word
     spelling matching nobody.
     """
-    decomposed = unicodedata.normalize("NFKD",
-                                       (text or "").translate(_FOLD_MAP))
-    bare = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
     words = []
-    for chunk in _WORD_SPLIT.split(bare.casefold()):
-        if not chunk:
-            continue
-        parts = [part for part in _APOSTROPHE_SPLIT.split(chunk) if part]
+    for parts in _fold_words(text):
         words.extend(parts)
         if len(parts) > 1:
             words.append("".join(parts))
     return " ".join(words)
+
+
+def _fold_variants(text):
+    """Every word set someone could reasonably type for this one name.
+
+    An apostrophe word can be typed three ways - "O'Brien", "O Brien",
+    "OBrien" - which fold to different word sets. Each is enumerated so the
+    Enter key's exact test can match on any of them.
+    """
+    variants = [frozenset()]
+    for parts in _fold_words(text):
+        spellings = [frozenset(parts)]
+        if len(parts) > 1:
+            spellings.append(frozenset(["".join(parts)]))
+        variants = [variant | spelling
+                    for variant in variants
+                    for spelling in spellings]
+        if len(variants) > MAX_FORM_VARIANTS:
+            variants = variants[:MAX_FORM_VARIANTS]
+    keys = {variant for variant in variants if variant}
+    # However many were enumerated, the spelling _fold itself produces has
+    # to be one of them.
+    everything = frozenset(_fold(text).split())
+    if everything:
+        keys.add(everything)
+    return keys
 
 
 class AddParticipants(Gramplet):
@@ -925,12 +977,17 @@ class AddParticipants(Gramplet):
                 marked = _("nicknamed %s") % nick
                 if marked not in others:
                     others.append(marked)
-        givens = " ".join([primary_given] + [g for g in alt_givens if g])
+        given_words = set(_fold(
+            " ".join([primary_given] + [g for g in alt_givens if g])).split())
         for call in calls:
-            if call and call not in givens:
-                marked = _("called %s") % call
-                if marked not in others:
-                    others.append(marked)
+            if not call:
+                continue
+            call_words = set(_fold(call).split())
+            if call_words and call_words <= given_words:
+                continue   # already visible as one of the given names
+            marked = _("called %s") % call
+            if marked not in others:
+                others.append(marked)
         for surname in self._index_spouses.get(handle, ()):
             marked = _("m. %s") % surname  # married into, not her own
             if surname != primary_surname and marked not in others:
@@ -1361,8 +1418,11 @@ class AddParticipants(Gramplet):
             return False
         return True
 
-    def _ranked_matches(self, text):
+    def _ranked_matches(self, text, folded=None):
         """(label, handle, search) for every match, best first.
+
+        `folded` lets a caller that has already folded the typed text hand
+        the result in rather than paying for it twice.
 
         Scoring is per typed word against the words of the indexed text:
         landing on a whole word beats starting one, which beats appearing in
@@ -1370,7 +1430,7 @@ class AddParticipants(Gramplet):
         name lives, ahead of alternate and married surnames - count for more.
         So "John Joy" puts "Joy, John Mervyn" above "Johnson, Bonnie [m. Joy]".
         """
-        tokens = _fold(text).split()
+        tokens = (_fold(text) if folded is None else folded).split()
         if not tokens:
             return []
         event_year = self._event_year()
@@ -1439,13 +1499,14 @@ class AddParticipants(Gramplet):
         text = entry.get_text().strip()
         if not text:
             return
-        matches = self._ranked_matches(text)
+        folded = _fold(text)
+        matches = self._ranked_matches(text, folded)
         # An exact hit on one of a person's own name forms wins outright.
         # Compared against the name, not the label: the label carries years
         # and bracketed annotations, so anyone with a date could never be an
         # exact match at all, and it insisted on surname-first order, which
         # is not how anybody types.
-        typed = frozenset(_fold(text).split())
+        typed = frozenset(folded.split())
         exact = [row for row in matches
                  if typed in self._index_forms.get(row[1], ())]
         if exact:

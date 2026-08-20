@@ -748,7 +748,7 @@ print("\n[S] raw indexing and the object path agree exactly")
 
 def parity(title, names, spouse=None, calendar=0, years=(1901,1980)):
     """Index one person both ways; insist the two agree byte for byte."""
-    entries=[]
+    entries=[]; forms=[]
     for force_object in (False, True):
         g,db=make()
         db.events["E1"]=Ev(0,years[0],calendar)
@@ -766,11 +766,14 @@ def parity(title, names, spouse=None, calendar=0, years=(1901,1980)):
               % (title, "object" if force_object else "raw"),
               g._index_raw is not force_object and "p1" in g.people_labels)
         entries.append(g.people_labels.get("p1"))
+        forms.append(g._index_forms.get("p1"))
     raw, obj = entries
     ok = raw is not None and obj is not None
     check("%s: labels identical: %r" % (title, ok and raw[0]),
           ok and raw[0]==obj[0])
     check("%s: search text identical" % title, ok and raw[1]==obj[1])
+    check("%s: Enter's name forms identical" % title,
+          forms[0] is not None and forms[0]==forms[1])
     return raw[0] if ok else ""
 
 lab = parity("plain", [Name("Jane","Doe"), Name("Jane","Smith",ntype=3)])
@@ -804,6 +807,16 @@ check("the nickname is shown and marked: %r" % lab, "nicknamed Buster" in lab)
 check("a call name that is not one of the given names is shown: %r" % lab,
       "called Sonny" in lab)
 check("...but one that is adds no clutter: %r" % lab, "called Mervyn" not in lab)
+
+# suppression is by whole word, case-folded: "Ann" is not "Annette"
+lab = parity("call name inside a given name",
+             [Name("Annette","Bell",call="Ann")])
+check("a call name that only looks like a prefix is shown: %r" % lab,
+      "called Ann" in lab)
+lab = parity("call name in another case",
+             [Name("John Mervyn","Joy",call="mervyn")])
+check("...and case alone does not make it a different name: %r" % lab,
+      "called mervyn" not in lab)
 
 lab = parity("hebrew calendar", [Name("Chaim","Levi")],
              calendar=Date.CAL_HEBREW, years=(5661,5740))
@@ -1425,6 +1438,36 @@ check("_fold keeps the split and the elided form: %r" % ap._fold("O'Brien"),
       ap._fold("O'Brien")=="o brien obrien")
 check("a plain name is untouched: %r" % ap._fold("Doe, Jane"),
       ap._fold("Doe, Jane")=="doe jane")
+
+# a precomposed letter decomposes to a stroked one, so the translation has
+# to come after NFKD or the stroke survives into the index
+check("'Soren' finds the precomposed 'ǿren' too: %r" % ap._fold("Sǿren"),
+      ap._fold("Sǿren")=="soren")
+check("...and 'Kjaer' the precomposed one: %r" % ap._fold("Kjǽr"),
+      ap._fold("Kjǽr")=="kjaer")
+g,db=make()
+db.people["p4"]=Person("x", names=[Name("Sǿren","Kjǽr")])
+g.build_people_cache(); drain(g)
+check("and they are searchable by the plain spelling",
+      any(h=="p4" for _l,h,_s in g._ranked_matches("Soren Kjaer")))
+
+print("\n[AQ] every spelling of an apostrophe name can match exactly")
+g,db=make()
+db.people["p1"]=Person("x", names=[Name("Sean","O'Brien")])
+db.people["p2"]=Person("x", names=[Name("Sean Patrick","O'Brienson")])
+g.build_people_cache(); drain(g)
+g.stage_person=lambda l,h: setattr(g,"staged",(l,h)); g.staged=None
+def enter_ap(typed):
+    g.staged=None; g.last_status=None
+    g.on_entry_activate(type("E",(),{"get_text":lambda s:typed,
+                                     "set_text":lambda s,t:None})())
+for spelling in ("Sean O'Brien", "Sean O Brien", "Sean OBrien"):
+    enter_ap(spelling)
+    check("%r stages the right man: %r" % (spelling, g.staged),
+          g.staged is not None and g.staged[1]=="p1")
+enter_ap("Sean")
+check("a given name alone is still ambiguous: %r" % g.last_status,
+      g.staged is None and "2 people match" in str(g.last_status))
 
 print("\n[AB] a change that lands during the index build is not clobbered")
 # The raw build walks a snapshot of the table taken at build_people_cache time.
