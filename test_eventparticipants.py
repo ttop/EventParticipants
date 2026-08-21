@@ -1355,7 +1355,7 @@ check("the imported person is searchable (%d indexed)" % len(g.people_labels),
       "p2" in g.people_labels)
 check("the rebuild source was cleared", g._rebuild_id==0)
 
-print("\n[AJ] a family participant covers both its spouses")
+print("\n[AJ] a family participant does not speak for its spouses")
 # A marriage is referenced by the Family, and the Events view counts both
 # spouses through it. Offering one of them again wrote a second, personal
 # reference at Primary and had the Main Participants column count them twice.
@@ -1381,56 +1381,53 @@ def select(g, index):
 g,db=married_tree()
 check("the family is the participant (%d rows)" % len(g.model),
       len(g.model)==1 and g.model[0][ap.COL_KIND]=="Family")
-check("its spouses were noted as the row loaded: %r" % (g._family_spouses,),
-      g._family_spouses.get("f1")==("h","w"))
+# A listed family does NOT speak for its spouses in the offer. Their family
+# reference does stand for them in Main Participants, so adding them
+# personally means being named twice there - that is the user's call, and
+# refusing the edit was second-guessing them over one duplicated name.
 g.refresh_completion()
-check("both spouses are held to be listed already",
-      g._completion_excluded=={"h","w"})
-check("so neither is offered: %r" % [h for _l,h,_s in g._ranked_matches("Brown")],
-      g._ranked_matches("Brown")==[])
-g.stage_person("Brown, Bob","h")
-check("and staging one directly adds nothing (%d rows)" % len(g.model),
-      len(g.model)==1)
-check("...it says why instead: %r" % g.last_status,
-      "through a family" in str(g.last_status))
-# detaching the family releases them again
-g._set_state(g.model[0], ap.STATE_DETACH)
-g.refresh_completion()
-check("detaching the family offers the spouses back",
+check("a listed family excludes nobody: %r" % (g._completion_excluded,),
       g._completion_excluded==frozenset())
+check("its spouses are offered: %r" % [h for _l,h,_s in g._ranked_matches("Brown")],
+      sorted(h for _l,h,_s in g._ranked_matches("Brown"))==["h","w"])
+g.stage_person("Brown, Bob","h")
+check("and staging one adds it (%d rows)" % len(g.model),
+      len(g.model)==2)
+check("...with no complaint: %r" % g.last_status,
+      "through a family" not in str(g.last_status))
 
-print("\n[AJ2] putting a detached family back unstages the spouse again")
-# Detach F, stage a spouse personally (allowed, F released them), then hit
-# Remove on F again to un-detach it. Applying both would write exactly the
-# duplicate reference the exclusion exists to prevent.
+print("\n[AJ2] a spouse staged personally survives the family coming back")
+# Detach F, stage a spouse personally, then un-detach F. Both staying is now
+# the point: the duplicate is the user\'s to make, so nothing is unstaged
+# behind their back.
 g,db=married_tree()
 select(g, 0)
 g.on_remove(None)                       # detach the family
 check("the family is staged for detachment",
       g.model[0][ap.COL_STATE]==ap.STATE_DETACH)
 g.stage_person("Brown, Bob","h")
-check("its husband can now be staged personally (%d rows)" % len(g.model),
+check("its husband can be staged personally (%d rows)" % len(g.model),
       len(g.model)==2)
 g.on_remove(None)                       # un-detach the family
 check("the family is attached again",
       g.model[0][ap.COL_STATE]==ap.STATE_EXISTING)
-check("and the staged spouse is gone (%d rows)" % len(g.model),
-      len(g.model)==1)
-check("...with a word about why: %r" % g.last_status,
-      "covered by a family" in str(g.last_status))
+check("and the staged spouse is still there (%d rows)" % len(g.model),
+      len(g.model)==2)
+check("...unstaged behind nobody\'s back: %r" % g.last_status,
+      "covered by a family" not in str(g.last_status))
 
-# and the transaction refuses it even if a row gets there some other way
+# and the transaction writes it rather than skipping it
 g,db=married_tree()
 g.model.append(row("Brown, Bob","Primary",ap.STATE_NEW,"h","Person","",-1))
 g.load_participants=lambda:None; g.refresh_completion=lambda force=False:None
 g.update_status=lambda:None
 g.on_apply(None)
-check("no personal reference was written: %r" % db.people["h"].refs,
-      db.people["h"].refs==[])
+check("the personal reference was written: %r" % db.people["h"].refs,
+      len(db.people["h"].refs)==1)
 check("the family reference is untouched (%d)" % len(db.families["f1"].refs),
       len(db.families["f1"].refs)==1)
-check("and the apply says it skipped it: %r" % g.last_status,
-      "+0" in str(g.last_status) and "no longer matched" in str(g.last_status))
+check("and the apply counts it: %r" % g.last_status,
+      "+1" in str(g.last_status) and "no longer matched" not in str(g.last_status))
 
 print("\n[AJ3] an active family row follows family updates and deletes")
 g,db=married_tree()
@@ -1440,8 +1437,8 @@ db.families["f1"]=Family(father="h", mother="w2",
 g.on_families_changed(["f1"])
 check("a relinked family row shows the new spouse: %r" % g.model[0][ap.COL_NAME],
       "Jill" in g.model[0][ap.COL_NAME] and "Jane" not in g.model[0][ap.COL_NAME])
-check("and the covered set follows the new couple: %r" % (g._completion_excluded,),
-      g._completion_excluded=={"h","w2"})
+check("and no one is excluded on account of it: %r" % (g._completion_excluded,),
+      g._completion_excluded==frozenset())
 
 g,db=married_tree()
 del db.families["f1"]

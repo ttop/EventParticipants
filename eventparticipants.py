@@ -358,7 +358,6 @@ class EventParticipants(Gramplet):
         self._rebuild_id = 0        # idle source coalescing bulk rebuilds
         self._applying = False      # inside our own apply transaction
         self._notice = ""           # one-shot message for the status label
-        self._family_spouses = {}   # listed family handle -> spouse handles
         self._recache_pending = set()   # people waiting to be re-cached
         self._recache_id = 0        # idle source draining that set
         self.gui.WIDGET = self.build_gui()
@@ -485,7 +484,6 @@ class EventParticipants(Gramplet):
         self.event = None
         self.event_handle = None
         self.model.clear()
-        self._family_spouses = {}
         # An import queued a rebuild against the tree that is going away;
         # letting it fire would rebuild the new tree's index a second time.
         self._cancel_rebuild()
@@ -697,8 +695,6 @@ class EventParticipants(Gramplet):
                     wives.add(previous)
                 family = self._get_family(handle)
                 if family is None:
-                    # A family that is listed but gone covers nobody now.
-                    self._family_spouses.pop(handle, None)
                     if handle in listed:
                         reload_rows = True
                     continue
@@ -710,14 +706,6 @@ class EventParticipants(Gramplet):
                         and any(ref.ref == active_event
                                 for ref in family.get_event_ref_list())):
                     reload_rows = True
-                if handle in self._family_spouses:
-                    # A spouse just unlinked stops being covered by this
-                    # row, and one just linked starts.
-                    self._family_spouses[handle] = tuple(
-                        spouse
-                        for spouse in (family.get_father_handle(), mother)
-                        if spouse
-                    )
             except Exception:
                 # One unreadable family must not abandon the rest.
                 LOG.debug("could not re-read family %s", handle, exc_info=True)
@@ -1481,7 +1469,6 @@ class EventParticipants(Gramplet):
     def load_participants(self):
         """Populate the list from everything referencing this event."""
         self.model.clear()
-        self._family_spouses = {}
         db = self.dbstate.db
         ev_handle = self.event.get_handle()
 
@@ -1503,14 +1490,6 @@ class EventParticipants(Gramplet):
             elif class_name == "Family":
                 obj = self._get_family(handle)
                 label = self._family_label(obj) if obj else None
-                if obj is not None:
-                    # Noted here, once, so the offer's bookkeeping never has
-                    # to read the family back out of the database.
-                    self._family_spouses[handle] = tuple(
-                        spouse for spouse in (obj.get_father_handle(),
-                                              obj.get_mother_handle())
-                        if spouse
-                    )
             else:
                 continue
             if obj is None:
@@ -1531,58 +1510,20 @@ class EventParticipants(Gramplet):
                 )
                 nth += 1
 
-    def _covered_by_family(self):
-        """Spouses a family row that is staying attached already covers.
-
-        A participating family's reference stands for both its spouses, and
-        that is how the Events view counts them, so offering one of them
-        again is offering a duplicate: accepting it writes a second,
-        personal reference at Primary and the Main Participants column
-        counts them twice. Attaching a spouse in their own right, with a
-        role of their own, is still possible the stock way.
-
-        The spouse handles were read when the row was loaded
-        (_family_spouses), so this stays a walk over the model: it runs
-        ahead of refresh_completion's early return, and re-reading every
-        listed family from the database on each keystroke's worth of
-        bookkeeping defeated the point of that early return.
-        """
-        covered = set()
-        for row in self.model:
-            if row[COL_KIND] == "Family" and row[COL_STATE] != STATE_DETACH:
-                covered.update(self._family_spouses.get(row[COL_HANDLE], ()))
-        return covered
-
     def _listed_person_handles(self):
-        """Everyone the participant list already covers."""
-        listed = self._covered_by_family()
+        """People the participant list already holds a row for.
+
+        A spouse of a participating family is deliberately *not* here. Their
+        family's reference does stand for them in the Events view's Main
+        Participants column, so adding them personally means being named
+        twice there - but that is the user's call to make, and refusing the
+        edit was second-guessing them over one duplicated name.
+        """
+        listed = set()
         for row in self.model:
             if row[COL_KIND] == "Person" and row[COL_STATE] != STATE_DETACH:
                 listed.add(row[COL_HANDLE])
         return frozenset(listed)
-
-    def _drop_covered_staged(self):
-        """Unstage anyone a family row has just taken back over.
-
-        Detaching a family releases its spouses into the offer, so one can
-        be staged personally; putting the family back covers them again, and
-        applying both would write the very duplicate reference
-        _covered_by_family exists to prevent.
-        """
-        covered = self._covered_by_family()
-        if not covered:
-            return
-        dropped = []
-        for index in reversed(range(len(self.model))):
-            row = self.model[index]
-            if (row[COL_STATE] == STATE_NEW and row[COL_KIND] == "Person"
-                    and row[COL_HANDLE] in covered):
-                dropped.append(row[COL_NAME])
-                del self.model[index]
-        if dropped:
-            self._notice = _("Unstaged %s: covered by a family again") % (
-                ", ".join(reversed(dropped))
-            )
 
     def refresh_completion(self, force=False):
         """Note who is already listed and refresh what the type-ahead offers.
@@ -1787,13 +1728,6 @@ class EventParticipants(Gramplet):
             self.refresh_completion()
             self.update_status()
             return
-        if handle in self._completion_excluded:
-            # Not listed as a person, but covered by a participating family
-            # - see _listed_person_handles.
-            self.status.set_text(
-                _("%s already takes part through a family") % label
-            )
-            return
         self.model.append(
             [label, self._default_role(), STATE_NEW, handle,
              "Person", "", -1, int(Pango.Weight.BOLD),
@@ -1871,9 +1805,6 @@ class EventParticipants(Gramplet):
             model.remove(treeiter)
         elif state == STATE_DETACH:
             self._set_state(model[treeiter], STATE_EXISTING)
-            # Putting a family back covers its spouses again, so anyone
-            # staged personally while it was detached has to go.
-            self._drop_covered_staged()
         else:
             self._set_state(model[treeiter], STATE_DETACH)
         self.refresh_completion()
@@ -1966,12 +1897,6 @@ class EventParticipants(Gramplet):
                  row[COL_REFNTH])
             )
 
-        # A family that is staying attached already covers its spouses. The
-        # offer knows that, but a person can still be staged while the family
-        # is detached and then have it put back, so the guard is repeated
-        # here where the writing happens.
-        covered = self._covered_by_family()
-
         # Counted as they happen rather than read off the model beforehand:
         # a row whose reference has moved under us is skipped, and saying
         # "applied" for it would be a lie.
@@ -2028,11 +1953,6 @@ class EventParticipants(Gramplet):
                     # Additions last, so _insert_index sees the final list.
                     for role, _orig, state, _nth in entries:
                         if state != STATE_NEW:
-                            continue
-                        if kind == "Person" and handle in covered:
-                            # A family reference already stands for them;
-                            # a personal one on top is the double count.
-                            skipped += 1
                             continue
                         if any(ref.ref == ev_handle for ref in refs):
                             # Attached from somewhere else in the meantime.
