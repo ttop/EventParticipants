@@ -23,9 +23,10 @@ Requires Gramps 6.0. GPL v2 (see [LICENSE](LICENSE)).
    |---|---|
    | URL | `https://raw.githubusercontent.com/ttop/EventParticipants/main/gramps60` |
 
-3. Back on the **Addons** tab, find **Event Participants** and press **Install**.
+3. Back on the **Addons** tab, change the Filter from "Stable" to "Beta," find **Event Participants** and press **Install**.
 4. Restart Gramps.
 
+* Note: This PlugIn seems stable and unlikely to be problematic, but I'd like there to be reports of successful usage before I mark it as Stable.
 
 ### From source
 
