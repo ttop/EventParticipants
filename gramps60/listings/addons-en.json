@@ -1,0 +1,13 @@
+[
+  {
+    "i": "Event Participants",
+    "n": "Event Participants",
+    "d": "Attach the selected event to multiple people at once, with type-ahead search and chronological insertion.",
+    "v": "1.0.0",
+    "t": 10,
+    "a": 0,
+    "s": 2,
+    "h": "",
+    "z": "EventParticipants.addon.tgz"
+  }
+]
