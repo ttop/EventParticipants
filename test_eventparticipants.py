@@ -515,7 +515,7 @@ g,db=make()
 g.people_cache=[("Amy Smith","p1","amy smith"),
                 ("Bob Smith","p2","bob smith")]
 g.refresh_completion()
-g.stage_person=lambda l,h: g.__setattr__("staged",(l,h))
+g.stage_person=lambda l,h: g.__setattr__("staged",(l,h)) or True
 g.staged=None
 ent=type("E",(),{"get_text":lambda s:"amy","set_text":lambda s,t:None})()
 g.on_entry_activate(ent)
@@ -523,8 +523,23 @@ check("unique substring match stages %r"%(g.staged,), g.staged==("Amy Smith","p1
 g.staged=None
 ent2=type("E",(),{"get_text":lambda s:"smith","set_text":lambda s,t:None})()
 g.on_entry_activate(ent2)
-check("ambiguous match stages nothing", g.staged is None)
-check("...and says so: %r"%g.last_status, "2" in str(g.last_status))
+# GtkEntryCompletion cannot preselect its top row, so Enter has to be the
+# thing that honours the ranking: it takes the best match rather than
+# refusing to choose between them.
+check("ambiguous match stages the best one: %r"%(g.staged,),
+      g.staged==("Amy Smith","p1"))
+check("...and says it chose: %r"%g.last_status,
+      "2" in str(g.last_status) and "Best" in str(g.last_status))
+# A refusal keeps its own message: stage_person returning False is what
+# stops "Best of N" being written over the top of it.
+g.staged=None
+g.stage_person=lambda l,h: False
+g.last_status=None
+ent2b=type("E",(),{"get_text":lambda s:"smith","set_text":lambda s,t:None})()
+g.on_entry_activate(ent2b)
+check("a refused stage is not announced as a choice: %r"%g.last_status,
+      "Best" not in str(g.last_status))
+g.stage_person=lambda l,h: g.__setattr__("staged",(l,h)) or True
 g.staged=None
 ent3=type("E",(),{"get_text":lambda s:"zzz","set_text":lambda s,t:None})()
 g.on_entry_activate(ent3)
@@ -1063,7 +1078,7 @@ db.people["dead"]=Person("x", names=[Name("Sarah","Fisher")],
                          b="b1", d="d1", refs=[Ref("b1"),Ref("d1")])
 g.build_people_cache(); drain(g)
 g.event=Ev(0,1990); g.event.get_handle=lambda:"E"
-g.stage_person=lambda l,h: g.__setattr__("staged",(l,h)); g.staged=None
+g.stage_person=lambda l,h: g.__setattr__("staged",(l,h)) or True; g.staged=None
 ent=type("E",(),{"get_text":lambda s:"Sarah Fisher",
                  "set_text":lambda s,t:None})()
 g.on_entry_activate(ent)
@@ -1492,7 +1507,7 @@ db.people["p1"]=Person("x", names=[Name("Amy","Smith")],
 db.people["p2"]=Person("x", names=[Name("Amy Jane","Smithson")])
 g.build_people_cache(); drain(g)
 g.refresh_completion()
-g.stage_person=lambda l,h: setattr(g,"staged",(l,h)); g.staged=None
+g.stage_person=lambda l,h: setattr(g,"staged",(l,h)) or True; g.staged=None
 
 def enter(typed):
     g.staged=None; g.last_status=None
@@ -1505,8 +1520,10 @@ enter("Amy Smith")
 check("a full name picks its owner out of the partial matches: %r"
       % (g.staged,), g.staged is not None and g.staged[1]=="p1")
 enter("Smith")
-check("a bare surname is still ambiguous: %r" % g.last_status,
-      g.staged is None and "2 people match" in str(g.last_status))
+check("a bare surname takes the best of them: %r" % (g.staged,),
+      g.staged is not None)
+check("...and says it was a choice among 2: %r" % g.last_status,
+      "2" in str(g.last_status) and "Best" in str(g.last_status))
 
 # (b) a search that only turns up people already listed says so
 g,db=make()
@@ -1515,7 +1532,7 @@ g.build_people_cache(); drain(g)
 g.model.append(row("Smith, Amy","Primary",ap.STATE_EXISTING,
                    "p1","Person","Primary",0))
 g.refresh_completion()
-g.stage_person=lambda l,h: setattr(g,"staged",(l,h)); g.staged=None
+g.stage_person=lambda l,h: setattr(g,"staged",(l,h)) or True; g.staged=None
 enter("Amy Smith")
 check("nothing is staged", g.staged is None)
 check("and it does not claim there is no such person: %r" % g.last_status,
@@ -1526,7 +1543,7 @@ g,db=make()
 for i in range(300):
     db.people["p%d"%i]=Person("x", names=[Name("G%d"%i,"S%d"%i)])
 g.build_people_cache()                       # started, not finished
-g.stage_person=lambda l,h: setattr(g,"staged",(l,h)); g.staged=None
+g.stage_person=lambda l,h: setattr(g,"staged",(l,h)) or True; g.staged=None
 enter("G299 S299")
 check("it says the index is still filling: %r" % g.last_status,
       "indexing" in str(g.last_status).lower())
@@ -1752,7 +1769,7 @@ g,db=make()
 db.people["p1"]=Person("x", names=[Name("Sean","O'Brien")])
 db.people["p2"]=Person("x", names=[Name("Sean Patrick","O'Brienson")])
 g.build_people_cache(); drain(g)
-g.stage_person=lambda l,h: setattr(g,"staged",(l,h)); g.staged=None
+g.stage_person=lambda l,h: setattr(g,"staged",(l,h)) or True; g.staged=None
 def enter_ap(typed):
     g.staged=None; g.last_status=None
     g.on_entry_activate(type("E",(),{"get_text":lambda s:typed,
@@ -1762,8 +1779,11 @@ for spelling in ("Sean O'Brien", "Sean O Brien", "Sean OBrien"):
     check("%r stages the right man: %r" % (spelling, g.staged),
           g.staged is not None and g.staged[1]=="p1")
 enter_ap("Sean")
-check("a given name alone is still ambiguous: %r" % g.last_status,
-      g.staged is None and "2 people match" in str(g.last_status))
+# Still the control for the above: an exact hit collapses to one match and
+# says nothing, so being told it chose between 2 is what proves a bare given
+# name is not being treated as an exact match on either man's name forms.
+check("a given name alone is not an exact match on either: %r" % g.last_status,
+      "2" in str(g.last_status) and "Best" in str(g.last_status))
 
 print("\n[AB] a change that lands during the index build is not clobbered")
 # The raw build walks a snapshot of the table taken at build_people_cache time.

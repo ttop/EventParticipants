@@ -1717,7 +1717,15 @@ class EventParticipants(Gramplet):
         return True
 
     def on_entry_activate(self, entry):
-        """Enter stages the person when the text picks out exactly one."""
+        """Enter stages the best match for what was typed.
+
+        GtkEntryCompletion opens its popup with nothing selected and offers
+        no way to preselect a row - the popup's treeview is private to the
+        widget - so "the top one" can only be honoured here, by taking the
+        first of the ranked matches rather than refusing to choose between
+        them. The popup shows that same order, so Enter takes the row the
+        list already has at the top.
+        """
         text = entry.get_text().strip()
         if not text:
             return
@@ -1733,15 +1741,18 @@ class EventParticipants(Gramplet):
                  if typed in self._index_forms.get(row[1], ())]
         if exact:
             matches = exact
-        if len(matches) == 1:
-            self.stage_person(matches[0][0], matches[0][1])
-            entry.set_text("")
-            return
         if matches:
-            self.status.set_text(
-                _("%(count)d people match '%(text)s'")
-                % {"count": len(matches), "text": text}
-            )
+            staged = self.stage_person(matches[0][0], matches[0][1])
+            entry.set_text("")
+            # Choosing for someone silently is what would make a wrong pick
+            # read as a bug rather than a near miss they can Remove, so say
+            # when there was a choice to make - but not over the top of
+            # stage_person's own refusal message.
+            if len(matches) > 1 and staged:
+                self._notice = _("Best of %(count)d matches for '%(text)s'") % {
+                    "count": len(matches), "text": text
+                }
+                self.update_status()
             return
         if self._index_id:
             # Nothing matches yet because most of the tree is not in the
@@ -1768,6 +1779,11 @@ class EventParticipants(Gramplet):
             self.status.set_text(_("No match for '%s'") % text)
 
     def stage_person(self, label, handle):
+        """Put a person on the list. False if they were turned away.
+
+        The caller needs to know, because a refusal comes with its own
+        message on the status label that must not be written over.
+        """
         # Always take the indexed label rather than whatever was displayed,
         # so nothing the completion adds for presentation can leak into the
         # participant list.
@@ -1786,14 +1802,14 @@ class EventParticipants(Gramplet):
                     self._set_state(row, STATE_EXISTING)
             self.refresh_completion()
             self.update_status()
-            return
+            return True
         if handle in self._completion_excluded:
             # Not listed as a person, but covered by a participating family
             # - see _listed_person_handles.
             self.status.set_text(
                 _("%s already takes part through a family") % label
             )
-            return
+            return False
         self.model.append(
             [label, self._default_role(), STATE_NEW, handle,
              "Person", "", -1, int(Pango.Weight.BOLD),
@@ -1801,6 +1817,7 @@ class EventParticipants(Gramplet):
         )
         self.refresh_completion()
         self.update_status()
+        return True
 
     @staticmethod
     def _set_state(row, state):
