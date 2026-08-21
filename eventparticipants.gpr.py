@@ -1,5 +1,5 @@
 #
-# Add Participants - a Gramps gramplet for attaching one event to many people
+# Event Participants - a Gramps gramplet for attaching one event to many people
 #
 # Copyright (C) 2026 Todd Wells <todd@wellshub.com>
 #
@@ -21,8 +21,8 @@
 
 register(
     GRAMPLET,
-    id="Add Participants",
-    name=_("Add Participants"),
+    id="Event Participants",
+    name=_("Event Participants"),
     description=_(
         "Attach the selected event to multiple people at once, "
         "with type-ahead search and chronological insertion."
@@ -31,13 +31,13 @@ register(
     # outright when stable_only is set (_pluginreg.py:1481), which
     # would hide the addon rather than just labelling it.
     status=BETA,
-    fname="addparticipants.py",
+    fname="eventparticipants.py",
     height=300,
     detached_width=600,
     detached_height=450,
     expand=True,
-    gramplet="AddParticipants",
-    gramplet_title=_("Add Participants"),
+    gramplet="EventParticipants",
+    gramplet_title=_("Event Participants"),
     version="1.0.0",
     gramps_target_version="6.0",
     navtypes=["Event"],
