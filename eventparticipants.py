@@ -29,7 +29,7 @@ import re
 import unicodedata
 from xml.sax.saxutils import escape as xml_escape
 
-from gi.repository import GLib, Gtk, Pango
+from gi.repository import Gdk, GLib, Gtk, Pango
 
 from gramps.gen.plug import Gramplet
 from gramps.gen.lib import Date, EventRef, EventRoleType, EventType
@@ -389,6 +389,12 @@ class EventParticipants(Gramplet):
 
         self.entry = Gtk.Entry()
         self.entry.set_placeholder_text(_("Type a name to add someone..."))
+        # Connected before set_completion() deliberately. Handlers run in
+        # the order they were connected, so this one gets the key first
+        # whether GTK closes the popup from GtkEntry's class closure or
+        # from something the completion attaches here - see
+        # on_entry_key_press.
+        self.entry.connect("key-press-event", self.on_entry_key_press)
         self.entry.set_completion(completion)
         self.entry.connect("activate", self.on_entry_activate)
         # set_completion() installs GTK's own "changed" handler, so it runs
@@ -1657,15 +1663,8 @@ class EventParticipants(Gramplet):
         self.entry.set_text("")
         return True
 
-    def on_entry_activate(self, entry):
-        """Enter stages the person when the text picks out exactly one.
-
-        With several still matching it does nothing and says nothing: the
-        drop-down is already showing them.
-        """
-        text = entry.get_text().strip()
-        if not text:
-            return
+    def _enter_matches(self, text):
+        """The matches Enter would be choosing between, best first."""
         folded = _fold(text)
         matches = self._ranked_matches(text, folded)
         # An exact hit on one of a person's own name forms wins outright.
@@ -1676,8 +1675,40 @@ class EventParticipants(Gramplet):
         typed = frozenset(folded.split())
         exact = [row for row in matches
                  if typed in self._index_forms.get(row[1], ())]
-        if exact:
-            matches = exact
+        return exact or matches
+
+    def on_entry_key_press(self, entry, event):
+        """Swallow Enter when it would do nothing, so the list stays up.
+
+        GtkEntry handles Return in its *class* closure, which runs after
+        handlers connected normally, and part of that handling is closing
+        the completion popup. With several people still matching, Enter has
+        nothing to commit - so letting it through only made the list vanish
+        with nothing to show for it, which reads as though something
+        happened. Returning True here stops the key ever reaching GTK, and
+        the popup is simply left alone. Escape still closes it, which is the
+        key people expect to.
+
+        Only that one case is swallowed: one match still stages on Enter,
+        and no matches still reaches on_entry_activate to say why.
+        """
+        if event.keyval not in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+            return False
+        text = entry.get_text().strip()
+        if not text:
+            return False
+        return len(self._enter_matches(text)) > 1
+
+    def on_entry_activate(self, entry):
+        """Enter stages the person when the text picks out exactly one.
+
+        With several still matching it does nothing and says nothing: the
+        drop-down is already showing them.
+        """
+        text = entry.get_text().strip()
+        if not text:
+            return
+        matches = self._enter_matches(text)
         if len(matches) == 1:
             self.stage_person(matches[0][0], matches[0][1])
             entry.set_text("")

@@ -81,10 +81,12 @@ def drain(g, max_turns=10000):
         if not cb(): break
     return turns
 
-rep.Gtk, rep.Pango, rep.GLib = Gtk, Pango, GLib; gi.repository=rep
+Gdk=types.ModuleType("gi.repository.Gdk")
+Gdk.KEY_Return=0xff0d; Gdk.KEY_KP_Enter=0xff8d; Gdk.KEY_Escape=0xff1b
+rep.Gtk, rep.Pango, rep.GLib, rep.Gdk = Gtk, Pango, GLib, Gdk; gi.repository=rep
 sys.modules.update({"gi":gi,"gi.repository":rep,
                     "gi.repository.Gtk":Gtk,"gi.repository.Pango":Pango,
-                    "gi.repository.GLib":GLib})
+                    "gi.repository.GLib":GLib,"gi.repository.Gdk":Gdk})
 
 class HandleError(Exception): pass
 def _mod(n,**a):
@@ -1869,6 +1871,49 @@ g.model.append(row("Family: A & B","Family",ap.STATE_DETACH,"f1","Family","Famil
 apply_only(g)
 check("a family row applies without reaching for birth/death (%d refs)"
       % len(f.refs), len(f.refs)==0)
+
+print("\n[AS] Enter leaves the drop-down alone when it has nothing to commit")
+# GtkEntry closes the completion popup as part of its own Return handling,
+# in a class closure that runs after handlers connected normally. With
+# several people still matching there is nothing for Enter to commit, so
+# letting it through only made the list vanish with no visible reason -
+# unexplained, and not what Escape is for. Swallowing the key stops GTK
+# ever seeing it, and the popup is left exactly as it was.
+g,db=make()
+g.people_cache=[("Amy Smith","p1","amy smith"),
+                ("Bob Smith","p2","bob smith"),
+                ("Zed Jones","p3","zed jones")]
+g.refresh_completion()
+def press(typed, keyval=ap.Gdk.KEY_Return):
+    entry=type("E",(),{"get_text":lambda s:typed,"set_text":lambda s,t:None})()
+    event=type("Ev",(),{"keyval":keyval})()
+    return g.on_entry_key_press(entry, event)
+
+check("several matches: Enter is swallowed, so the list stays up",
+      press("smith") is True)
+check("one match: Enter passes through and stages as before",
+      press("amy") is False)
+check("no match: Enter passes through so it can say why",
+      press("zzz") is False)
+check("an empty box passes through", press("") is False)
+check("any other key is none of our business",
+      press("smith", keyval=ap.Gdk.KEY_Escape) is False)
+check("the keypad's Enter counts too",
+      press("smith", keyval=ap.Gdk.KEY_KP_Enter) is True)
+
+# the swallow decision and what Enter actually does must not drift apart:
+# both read the same helper
+g.stage_person=lambda l,h: g.__setattr__("staged",(l,h)) or True
+for typed in ("smith", "amy", "zzz"):
+    g.staged=None; g.last_status=None
+    swallowed = press(typed)
+    if not swallowed:
+        g.on_entry_activate(type("E",(),{"get_text":lambda s:typed,
+                                         "set_text":lambda s,t:None})())
+    acted = g.staged is not None or bool(str(g.last_status or ""))
+    check("%r: swallowed=%s and then %s" % (typed, swallowed,
+          "acted" if acted else "did nothing"),
+          swallowed != acted)
 
 print("\n[AB] a change that lands during the index build is not clobbered")
 # The raw build walks a snapshot of the table taken at build_people_cache time.
