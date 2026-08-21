@@ -1917,6 +1917,13 @@ class EventParticipants(Gramplet):
                                        if _is_staged(entry))
                         continue
 
+                    # Captured before the list moves, restored after it
+                    # settles - see _restore_ref_indices.
+                    birth_ref = death_ref = None
+                    if kind == "Person":
+                        birth_ref = obj.get_birth_ref()
+                        death_ref = obj.get_death_ref()
+
                     refs = list(obj.get_event_ref_list())
                     # Where this object's references to *this* event sit now.
                     # Rows name which of them they mean, so an unrelated
@@ -1973,6 +1980,10 @@ class EventParticipants(Gramplet):
 
                     if changed:
                         obj.set_event_ref_list(refs)
+                        if kind == "Person":
+                            self._restore_ref_indices(
+                                obj, refs, birth_ref, death_ref
+                            )
                         self._commit_object(kind, obj, trans)
 
                 # Touch the event itself, inside the transaction. Nothing
@@ -2027,6 +2038,39 @@ class EventParticipants(Gramplet):
     def _sort_value(self, event):
         date = event.get_date_object()
         return date.get_sort_value() if date else 0
+
+    @staticmethod
+    def _restore_ref_indices(person, refs, birth_ref, death_ref):
+        """Point birth_ref_index/death_ref_index back at their own refs.
+
+        Gramps addresses a person's birth and death by *position* in
+        event_ref_list (`gen/lib/person.py:830`), and those two are the only
+        things in the whole data model that work that way - everything else
+        is reached by handle. Inserting a reference chronologically moves
+        every later entry down one, so the stored positions have to move
+        with them or they end up naming whatever slid into place: a Social
+        event becoming somebody's death, in the People view, in reports and
+        in this gramplet's own labels. Gramps keeps the same books for its
+        own removals (`gen/lib/person.py:443-447`); `set_event_ref_list` is
+        a plain setter (`gen/lib/eventbase.py:115`) and does nothing here.
+
+        Matched by identity, not arithmetic: the same EventRef objects are
+        in the new list, so this stays right however many inserts and
+        deletes happened and in whatever order. A ref that was detached
+        outright is no longer there, and -1 is Gramps' "no such event".
+        """
+        for ref, attr in ((birth_ref, "birth_ref_index"),
+                          (death_ref, "death_ref_index")):
+            if ref is None:
+                # Already -1, or an index Gramps itself could not resolve.
+                # Guessing a new one is not this gramplet's business.
+                continue
+            index = -1
+            for position, candidate in enumerate(refs):
+                if candidate is ref:
+                    index = position
+                    break
+            setattr(person, attr, index)
 
     def _insert_index(self, refs, new_sort, sort_values=None):
         """Chronological position. Undated events keep their place.

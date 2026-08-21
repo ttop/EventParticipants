@@ -279,16 +279,39 @@ class Family:
     def get_event_ref_list(self): return self.refs
     def set_event_ref_list(self,r): self.refs=r
 class Person:
+    """Models Gramps' positional birth/death pointers, because that is the
+    whole point of the indices tests: gen/lib/person.py keeps
+    birth_ref_index / death_ref_index as offsets into event_ref_list, and
+    get_birth_ref() hands back *that list element*, not a copy. Identity is
+    what lets the gramplet put the pointers back after the list moves."""
     def __init__(self,name,b=None,d=None,refs=None,names=None,families=None):
         self.name=name; self._b=b; self._d=d; self.refs=refs or []
         self._names=names; self.handle=None
         self.family_list=families or []
+        self.birth_ref_index=self._find(b)
+        self.death_ref_index=self._find(d)
+        # Older fixtures name a birth/death event without listing its ref.
+        # Those keep the old shim below; one that WAS listed gets Gramps'
+        # real semantics, including -1 meaning "no such event" once the
+        # reference is detached.
+        self._b_listed=self.birth_ref_index!=-1
+        self._d_listed=self.death_ref_index!=-1
+    def _find(self,handle):
+        for i,r in enumerate(self.refs):
+            if r.ref==handle: return i
+        return -1
     def get_primary_name(self):
         return self._names[0] if self._names else Name(raw=self.name)
     def get_alternate_names(self):
         return self._names[1:] if self._names else []
-    def get_birth_ref(self): return Ref(self._b) if self._b else None
-    def get_death_ref(self): return Ref(self._d) if self._d else None
+    def get_birth_ref(self):
+        if 0 <= self.birth_ref_index < len(self.refs):
+            return self.refs[self.birth_ref_index]
+        return Ref(self._b) if self._b and not self._b_listed else None
+    def get_death_ref(self):
+        if 0 <= self.death_ref_index < len(self.refs):
+            return self.refs[self.death_ref_index]
+        return Ref(self._d) if self._d and not self._d_listed else None
     def get_event_ref_list(self): return self.refs
     def get_primary_event_ref_list(self):
         return [r for r in self.refs if r.get_role().is_primary()]
@@ -1766,6 +1789,86 @@ for spelling in ("Sean O'Brien", "Sean O Brien", "Sean OBrien"):
 enter_ap("Sean")
 check("a given name alone is still ambiguous: %r" % (g.staged,),
       g.staged is None)
+
+print("\n[AR] a person's birth/death pointers survive the list moving")
+# Gramps addresses birth and death by POSITION in event_ref_list, and they
+# are the only two things in the data model that work that way. Inserting a
+# reference chronologically shifts every later entry down one, so the stored
+# positions must move too - otherwise the pointer names whatever slid into
+# its slot and a Residence event becomes somebody's death. This corrupted 32
+# people in the real tree before it was caught.
+def apply_only(g):
+    g.load_participants=lambda:None; g.refresh_completion=lambda force=False:None
+    g.update_status=lambda:None
+    g.on_apply(None)
+
+# (a) a new reference inserted BEFORE the death pointer
+g,db=make()
+birth=Ref("B1"); death=Ref("D1")
+p=Person("Nell", b="B1", d="D1", refs=[birth, death])
+db.people["p1"]=p
+db.events["B1"]=Ev(100,1900); db.events["D1"]=Ev(900,1990)
+db.events["E1"]=Ev(500,1950)
+g.event=db.events["E1"]; g.event.get_handle=lambda:"E1"
+check("death starts at index 1", p.death_ref_index==1)
+g.model.append(row("Nell","Primary",ap.STATE_NEW,"p1","Person","",-1))
+apply_only(g)
+check("the new ref landed chronologically in the middle (%d refs)" % len(p.refs),
+      len(p.refs)==3 and p.refs[1].ref=="E1")
+check("birth pointer still names the birth: %r" % p.birth_ref_index,
+      p.get_birth_ref() is birth)
+check("death pointer FOLLOWED the shift: %r" % p.death_ref_index,
+      p.death_ref_index==2 and p.get_death_ref() is death)
+
+# (b) the mirror case: detaching a reference that sits before the death
+g,db=make()
+birth=Ref("B1"); mid=Ref("E1"); death=Ref("D1")
+p=Person("Owen", b="B1", d="D1", refs=[birth, mid, death])
+db.people["p1"]=p
+db.events["B1"]=Ev(100,1900); db.events["D1"]=Ev(900,1990)
+db.events["E1"]=Ev(500,1950)
+g.event=db.events["E1"]; g.event.get_handle=lambda:"E1"
+check("death starts at index 2", p.death_ref_index==2)
+g.model.append(row("Owen","Primary",ap.STATE_DETACH,"p1","Person","Primary",0))
+apply_only(g)
+check("the detached ref is gone (%d refs)" % len(p.refs), len(p.refs)==2)
+check("death pointer came back down with it: %r" % p.death_ref_index,
+      p.death_ref_index==1 and p.get_death_ref() is death)
+
+# (c) detaching the death event itself: Gramps' own answer is -1, not a
+# pointer at whatever took its place
+g,db=make()
+birth=Ref("B1"); death=Ref("E1")
+p=Person("Pearl", b="B1", d="E1", refs=[birth, death, Ref("Z1")])
+db.people["p1"]=p
+db.events["B1"]=Ev(100,1900); db.events["E1"]=Ev(900,1990); db.events["Z1"]=Ev(950,1995)
+g.event=db.events["E1"]; g.event.get_handle=lambda:"E1"
+check("death starts at index 1", p.death_ref_index==1)
+g.model.append(row("Pearl","Primary",ap.STATE_DETACH,"p1","Person","Primary",0))
+apply_only(g)
+check("the death reference is gone (%d refs)" % len(p.refs), len(p.refs)==2)
+check("and the pointer says 'none' rather than naming its neighbour: %r"
+      % p.death_ref_index, p.death_ref_index==-1 and p.get_death_ref() is None)
+
+# (d) a person with no death recorded keeps -1 rather than acquiring one
+g,db=make()
+p=Person("Quinn", refs=[Ref("Z1")])
+db.people["p1"]=p; db.events["Z1"]=Ev(100,1900); db.events["E1"]=Ev(500,1950)
+g.event=db.events["E1"]; g.event.get_handle=lambda:"E1"
+g.model.append(row("Quinn","Primary",ap.STATE_NEW,"p1","Person","",-1))
+apply_only(g)
+check("no death is invented: %r" % p.death_ref_index, p.death_ref_index==-1)
+
+# (e) families have no such pointers; the restore must not touch them
+g,db=make()
+f=Family(father="h", mother="w", refs=[Ref("E1","Family")])
+db.families["f1"]=f
+db.events["E1"]=Ev(500,1950)
+g.event=db.events["E1"]; g.event.get_handle=lambda:"E1"
+g.model.append(row("Family: A & B","Family",ap.STATE_DETACH,"f1","Family","Family",0))
+apply_only(g)
+check("a family row applies without reaching for birth/death (%d refs)"
+      % len(f.refs), len(f.refs)==0)
 
 print("\n[AB] a change that lands during the index build is not clobbered")
 # The raw build walks a snapshot of the table taken at build_people_cache time.
