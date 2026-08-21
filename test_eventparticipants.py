@@ -522,9 +522,12 @@ g.on_entry_activate(ent)
 check("unique substring match stages %r"%(g.staged,), g.staged==("Amy Smith","p1"))
 g.staged=None
 ent2=type("E",(),{"get_text":lambda s:"smith","set_text":lambda s,t:None})()
+g.last_status="SENTINEL"          # so an absent message cannot pass vacuously
 g.on_entry_activate(ent2)
 check("ambiguous match stages nothing", g.staged is None)
-check("...and says so: %r"%g.last_status, "2" in str(g.last_status))
+# and says nothing: the drop-down is already showing the matches
+check("...silently, leaving the label alone: %r"%g.last_status,
+      g.last_status=="SENTINEL")
 g.staged=None
 ent3=type("E",(),{"get_text":lambda s:"zzz","set_text":lambda s,t:None})()
 g.on_entry_activate(ent3)
@@ -1502,8 +1505,10 @@ enter("Amy Smith")
 check("a full name picks its owner out of the partial matches: %r"
       % (g.staged,), g.staged is not None and g.staged[1]=="p1")
 enter("Smith")
-check("a bare surname is still ambiguous: %r" % g.last_status,
-      g.staged is None and "2 people match" in str(g.last_status))
+check("a bare surname is still ambiguous: %r" % (g.staged,),
+      g.staged is None)
+check("...and Enter says nothing about it: %r" % g.last_status,
+      not str(g.last_status or ""))
 
 # (b) a search that only turns up people already listed says so
 g,db=make()
@@ -1759,8 +1764,8 @@ for spelling in ("Sean O'Brien", "Sean O Brien", "Sean OBrien"):
     check("%r stages the right man: %r" % (spelling, g.staged),
           g.staged is not None and g.staged[1]=="p1")
 enter_ap("Sean")
-check("a given name alone is still ambiguous: %r" % g.last_status,
-      g.staged is None and "2 people match" in str(g.last_status))
+check("a given name alone is still ambiguous: %r" % (g.staged,),
+      g.staged is None)
 
 print("\n[AB] a change that lands during the index build is not clobbered")
 # The raw build walks a snapshot of the table taken at build_people_cache time.

@@ -1658,7 +1658,11 @@ class EventParticipants(Gramplet):
         return True
 
     def on_entry_activate(self, entry):
-        """Enter stages the person when the text picks out exactly one."""
+        """Enter stages the person when the text picks out exactly one.
+
+        With several still matching it does nothing and says nothing: the
+        drop-down is already showing them.
+        """
         text = entry.get_text().strip()
         if not text:
             return
@@ -1679,10 +1683,9 @@ class EventParticipants(Gramplet):
             entry.set_text("")
             return
         if matches:
-            self.status.set_text(
-                _("%(count)d people match '%(text)s'")
-                % {"count": len(matches), "text": text}
-            )
+            # Deliberately silent. The drop-down is showing those matches
+            # right there, so counting them is telling the user what is
+            # already in front of them.
             return
         if self._index_id:
             # Nothing matches yet because most of the tree is not in the
