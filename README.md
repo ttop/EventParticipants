@@ -44,8 +44,6 @@ cp eventparticipants.py eventparticipants.gpr.py \
    ~/.local/share/gramps/gramps60/plugins/EventParticipants/
 ```
 
-Symlinking instead of copying works too, and makes edits live with no copy step.
-
 ### After Installation
 
 Restart Gramps fully — it does not pick up new plugin code otherwise. Then go to the **Events** view and click the **▼** at the right-hand end of the bottombar tab strip → **Add a gramplet** → **Event Participants**.
@@ -56,11 +54,11 @@ Select an event in the Events view. The header shows its type, date and descript
 
 ### Adding people
 
-Type into the search box. Matching is word by word, in any order, against every form of the name — "john joy" finds `Joy, John Mervyn`, and so does "joy john". Results are ranked best-first, so the person you meant is at the top rather than wherever the alphabet put them.
+Type into the search box. Matching is word by word, in any order, against every form of the name — "john joy" finds `Joy, John Mervyn`, and so does "joy john". "Flo Joy" finds Florence Reyman who married John Joy. Results are ranked best-first, so the person you meant is at the top rather than wherever the alphabet put them.
 
-Press **Enter** when what you typed narrows to one person, or arrow to a row and Enter, or click any row in the drop-down. 
+Use the arrow keys to navigate to a result and Enter to select it, or click any row in the drop-down. 
 
-The search covers more than the displayed name, it will also match on married names, nicknames, alternate surnames, etc.
+The search matches more than the person's default name, it will also match on married names, nicknames, alternate surnames, etc.
 
 It also narrows the list and removes people who probably could not have been alive at the time of the event, with a 2-year grace period for events after a person's death (for burial, probate, etc).
 
